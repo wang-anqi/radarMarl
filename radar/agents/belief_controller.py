@@ -1,6 +1,7 @@
 import torch
 from radar.agents.controller import Controller
 from radar.belief.belief import Belief
+import os
 
 class BeliefController(Controller):
     """基于信念机制的控制器"""
@@ -236,27 +237,54 @@ class BeliefController(Controller):
         Args:
             path: 权重文件保存路径
         """
-        # 创建包含所有网络状态的字典
-        state_dict = {
-            'feature_extractor': self.belief_net.feature_extractor.state_dict(),
-            'belief_proj': self.belief_net.belief_proj.state_dict()
-        }
-        
-        # 如果使用RNN，也保存RNN的权重
-        if self.belief_net.rnn is not None:
-            state_dict['rnn'] = self.belief_net.rnn.state_dict()
-        
-        # 保存当前的RNN状态和masks
-        state_dict['rnn_states'] = self.belief_rnn_states
-        state_dict['masks'] = self.masks
-        
-        # 保存其他重要参数
-        state_dict['adversary_ids'] = self.adversary_ids
-        state_dict['adversary_ratio'] = self._adversary_ratio
-        
-        # 保存到文件
-        torch.save(state_dict, path)
-        print(f"Belief network weights saved to {path}")
+        try:
+            # 确保目录存在
+            save_dir = os.path.dirname(path)
+            if not os.path.exists(save_dir):
+                os.makedirs(save_dir, exist_ok=True)
+            
+            # 如果path是目录，在其中创建带时间戳的文件名
+            if os.path.isdir(path):
+                from datetime import datetime
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"belief_weights_{timestamp}.pth"
+                path = os.path.join(path, filename)
+            # 如果path是文件但没有扩展名，添加.pth扩展名
+            elif not os.path.splitext(path)[1]:
+                path = path + ".pth"
+                
+            # 创建包含所有网络状态的字典
+            state_dict = {
+                'feature_extractor': self.belief_net.feature_extractor.state_dict(),
+                'belief_proj': self.belief_net.belief_proj.state_dict()
+            }
+            
+            # 如果使用RNN，也保存RNN的权重
+            if self.belief_net.rnn is not None:
+                state_dict['rnn'] = self.belief_net.rnn.state_dict()
+            
+            # 保存当前的RNN状态和masks
+            state_dict['rnn_states'] = self.belief_rnn_states
+            state_dict['masks'] = self.masks
+            
+            # 保存其他重要参数
+            state_dict['adversary_ids'] = self.adversary_ids
+            state_dict['adversary_ratio'] = self._adversary_ratio
+            
+            # 保存到文件
+            torch.save(state_dict, path)
+            print(f"Belief network weights saved to {path}")
+            
+        except Exception as e:
+            print(f"Error saving weights to {path}: {str(e)}")
+            # 尝试使用备用路径
+            try:
+                backup_path = os.path.join("weights", "belief_weights_backup.pth")
+                os.makedirs("weights", exist_ok=True)
+                torch.save(state_dict, backup_path)
+                print(f"Weights saved to backup location: {backup_path}")
+            except Exception as e2:
+                print(f"Failed to save to backup location: {str(e2)}")
     
     def load_weights(self, path):
         """加载belief网络的权重

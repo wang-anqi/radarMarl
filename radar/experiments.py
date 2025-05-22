@@ -4,6 +4,7 @@ import numpy
 import random
 import radar.algorithm as algorithm
 import radar.controller_loader as controller_loader
+import os
 
 def log(log_level, message_level, message):
     if message_level <= log_level:
@@ -189,5 +190,8 @@ def run(controller, nr_episodes, params, log_level=0):
         "test_domain_statistic":test_domain_statistics
     }
     data.save_json(join(path, "returns.json"), return_values)
+    # 确保目录存在
+    if not os.path.exists(path):
+        os.makedirs(path, exist_ok=True)
     controller.save_weights(path)
     return return_values
