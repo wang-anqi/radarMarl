@@ -1,5 +1,7 @@
 # nr_steps = 2000000
-nr_steps = 300
+# nr_steps = 300
+nr_steps = 500
+
 
 params = {}
 params["test_adversary_ratios"] = [-1, 0, 0.25, 0.5, 0.75]
