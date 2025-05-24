@@ -52,7 +52,7 @@ def run_episode(episode_id, controller, params, is_adversary, training_mode=True
         summary_filename = "episode_{}.json".format(episode_id)
         data.save_json(join(path, summary_filename), state_summaries)
         del state_summaries
-    return protagonist_discounted_return, protagonist_undiscounted_return, policy_updated
+    return protagonist_discounted_return, protagonist_undiscounted_return, policy_updated, time_step
 
 def run_test(env, nr_test_episodes, controller, params, test_adversary_ratio, log_level, is_adversary):
     training_adversary_ratio = controller.adversary_ratio # Save ratio for later training
@@ -82,6 +82,36 @@ def run_test_suite(env, nr_test_episodes, controller, params, log_level, is_adve
     result_undiscounted_returns = {"protagonist_mode": not is_adversary, "test_results": {}}
     result_domain_statistics = {"protagonist_mode": not is_adversary, "test_results": {}}
     labels = []
+    
+    # 对于 BELIEF_QMIX，只测试自身
+    if algorithm_choice == "BELIEF_QMIX":
+        test_agent = controller  # 直接使用当前控制器
+        label = "BELIEF_QMIX"
+        labels.append(label)
+        d_return, u_return, d_statistic = \
+            run_test(env, nr_test_episodes, test_agent, params, test_agent.adversary_ratio, -1, is_adversary)
+        
+        result_discounted_returns["test_results"][label] = d_return
+        result_undiscounted_returns["test_results"][label] = u_return
+        result_domain_statistics["test_results"][label] = d_statistic
+        
+        print("-- R =", test_agent.adversary_ratio,"|",label,"|",test_agent.adversary_ratio)
+        
+        if not is_adversary:
+            test_prefix = "Protagonist"
+        else:
+            test_prefix = "Adversary"
+            
+        log(log_level, 0, "{} episode {} finished:\n\tdiscounted return: {}\n\tundiscounted return: {}\n\tdomain statistics: {}"
+            .format(params["domain_name"], "{} Test {} vs. {} ({})"\
+                .format(test_prefix, algorithm_choice, label, test_agent.adversary_ratio),\
+                result_discounted_returns["test_results"][label],\
+                result_undiscounted_returns["test_results"][label],\
+                result_domain_statistics["test_results"][label]))
+                
+        return result_discounted_returns, result_undiscounted_returns, result_domain_statistics
+    
+    # 其他算法的原有逻辑
     for test_algorithm in params["test_algorithms"]:
         if is_adversary:
             test_adversary_ratios = [ratio for ratio in test_adversary_ratios if ratio > 0]
@@ -148,50 +178,59 @@ def run(controller, nr_episodes, params, log_level=0):
     training_adversary_ratios = []
     test_discounted_returns = []
     test_undiscounted_returns = []
-    protagonist_discounted_returns = []
-    protagonist_undiscounted_returns = []
     domain_statistic = []
     test_domain_statistics = []
     is_adversary = False
+    total_steps = 0  # 实际训练步数
+    max_steps = params.get("nr_steps", float("inf"))  # 从参数中获取最大步数
+    
     test_discounted_return, test_undiscounted_return, test_domain_statistic = \
         test_suite(env, nr_test_episodes, controller, params, log_level, is_adversary)
     test_discounted_returns.append(test_discounted_return)
     test_undiscounted_returns.append(test_undiscounted_return)
     test_domain_statistics.append(test_domain_statistic)
     nr_epoch_updates = 0
+    
     for episode_id in range(nr_episodes):
-        protagonist_discounted_return, protagonist_undiscounted_return, policy_updated =\
+        # 检查是否达到总步数限制
+        if total_steps >= max_steps:
+            print(f"\n达到训练步数限制 {max_steps}，停止训练")
+            break
+            
+        protagonist_discounted_return, protagonist_undiscounted_return, policy_updated, episode_steps =\
             run_episode(episode_id, controller, params, is_adversary, True, log_level)
+            
+        # 更新实际训练步数
+        total_steps += episode_steps
+        
         if policy_updated:
-            print("=====> updated in episode",(episode_id+1), "<=====")
+            print(f"\n=====> Episode {episode_id+1} 更新完成 <=====")
+            print(f"当前训练步数: {total_steps}/{max_steps}")
+            print(f"本轮实际步数: {episode_steps}")
             is_adversary = not is_adversary
             test_discounted_return, test_undiscounted_return, test_domain_statistic = \
                 test_suite(env, nr_test_episodes, controller, params, log_level, is_adversary)
             test_discounted_returns.append(test_discounted_return)
             test_undiscounted_returns.append(test_undiscounted_return)
             test_domain_statistics.append(test_domain_statistic)
+            training_discounted_returns.append(protagonist_discounted_return)
+            training_undiscounted_returns.append(protagonist_undiscounted_return)
             training_adversary_ratios.append(controller.adversary_ratio)
-            controller.sample_adversary_ratio()
             nr_epoch_updates += 1
-        protagonist_discounted_returns.append(protagonist_discounted_return)
-        protagonist_undiscounted_returns.append(protagonist_undiscounted_return)
-        training_discounted_returns.append(env.discounted_return)
-        training_undiscounted_returns.append(env.undiscounted_return)
-        domain_statistic.append(env.domain_statistic(controller.adversary_ids))
-    log(log_level, 0, "DONE")
-    return_values = {
-        "training_discounted_returns":training_discounted_returns,
-        "training_undiscounted_returns":training_undiscounted_returns,
-        "test_discounted_returns":test_discounted_returns,
-        "test_undiscounted_returns":test_undiscounted_returns,
-        "protagonist_discounted_returns":protagonist_discounted_returns,
-        "protagonist_undiscounted_returns":protagonist_undiscounted_returns,
-        "training_domain_statistic":domain_statistic,
-        "test_domain_statistic":test_domain_statistics
+            
+    print(f"\n训练结束:")
+    print(f"总训练步数: {total_steps}/{max_steps}")
+    print(f"完成episode数: {episode_id + 1}/{nr_episodes}")
+    print(f"策略更新次数: {nr_epoch_updates}")
+            
+    return {
+        "training_discounted_returns": training_discounted_returns,
+        "training_undiscounted_returns": training_undiscounted_returns,
+        "training_adversary_ratios": training_adversary_ratios,
+        "test_discounted_returns": test_discounted_returns,
+        "test_undiscounted_returns": test_undiscounted_returns,
+        "test_domain_statistics": test_domain_statistics,
+        "total_steps": total_steps,
+        "completed_episodes": episode_id + 1,
+        "policy_updates": nr_epoch_updates
     }
-    data.save_json(join(path, "returns.json"), return_values)
-    # 确保目录存在
-    if not os.path.exists(path):
-        os.makedirs(path, exist_ok=True)
-    controller.save_weights(path)
-    return return_values

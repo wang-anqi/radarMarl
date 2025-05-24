@@ -70,10 +70,23 @@ class QMixNet(nn.Module):
             nn.Linear(mixing_embed_dim, n_agents),
             nn.Sigmoid()  # 控制融合权重在[0,1]范围内
         )
+        
+        # 手动设置恶意智能体的掩码
+        self.malicious_mask = torch.ones(n_agents)
+
+    def set_malicious_agents(self, agent_indices):
+        """手动设置恶意智能体
+        
+        参数:
+            agent_indices: 恶意智能体的索引列表
+        """
+        self.malicious_mask = torch.ones(self.n_agents)
+        for idx in agent_indices:
+            self.malicious_mask[idx] = -1.0  # 恶意智能体的贡献将被反转
 
     def forward(self, agent_qs, states, beliefs):
         """
-        前向传播过程
+        前向传播过程，并打印每个智能体的贡献
         
         参数:
             agent_qs: 各智能体的Q值 [batch_size, n_agents]
@@ -83,7 +96,25 @@ class QMixNet(nn.Module):
         返回:
             q_total: 混合后的总Q值 [batch_size, 1]
         """
-        batch_size = agent_qs.size(0)
+        # 确保输入维度正确
+        if len(states.shape) == 1:
+            states = states.unsqueeze(0)  # [1, state_dim]
+        if len(beliefs.shape) == 1:
+            beliefs = beliefs.unsqueeze(0)  # [1, n_agents]
+        if len(agent_qs.shape) == 1:
+            agent_qs = agent_qs.unsqueeze(0)  # [1, n_agents]
+            
+        # 获取最大的batch_size
+        batch_sizes = [t.size(0) for t in [agent_qs, states, beliefs]]
+        batch_size = max(batch_sizes)
+        
+        # 扩展所有输入到相同的batch_size
+        if agent_qs.size(0) == 1 and batch_size > 1:
+            agent_qs = agent_qs.expand(batch_size, -1)
+        if states.size(0) == 1 and batch_size > 1:
+            states = states.expand(batch_size, -1)
+        if beliefs.size(0) == 1 and batch_size > 1:
+            beliefs = beliefs.expand(batch_size, -1)
         
         # 1. 多层次注意力机制
         # 1.1 状态层面的注意力权重
@@ -93,36 +124,56 @@ class QMixNet(nn.Module):
         belief_weights = self.belief_attention(beliefs)  # [batch_size, n_agents]
         
         # 1.3 融合两个层面的注意力
-        # 将状态和信念注意力拼接后通过融合网络
-        attention_concat = torch.cat([state_weights, belief_weights], dim=-1)
-        attention_weights = self.attention_fusion(attention_concat)
+        attention_concat = torch.cat([state_weights, belief_weights], dim=-1)  # [batch_size, 2*n_agents]
+        attention_weights = self.attention_fusion(attention_concat)  # [batch_size, n_agents]
         
-        # 2. 防御性机制
-        # 使用(1-belief)作为防御权重，belief值高的智能体影响将被降低
+        # 2. 应用恶意智能体掩码
+        malicious_mask = self.malicious_mask.to(states.device)
         defensive_weights = 1.0 - beliefs  # [batch_size, n_agents]
         
-        # 3. 最终权重：结合注意力权重和防御权重
-        final_weights = attention_weights * defensive_weights  # [batch_size, n_agents]
+        # 3. 最终权重：结合注意力权重、防御权重和恶意掩码
+        final_weights = attention_weights * defensive_weights * malicious_mask  # [batch_size, n_agents]
         
         # 4. 动态权重生成（通过超网络）
         # 4.1 生成第一层的权重和偏置
-        w1 = self.hyper_w1(states).view(-1, self.n_agents, self.mixing_embed_dim)
-        b1 = self.hyper_b1(states).view(-1, 1, self.mixing_embed_dim)
+        w1 = self.hyper_w1(states)  # [batch_size, mixing_embed_dim * n_agents]
+        b1 = self.hyper_b1(states)  # [batch_size, mixing_embed_dim]
+        
+        # 重塑权重和偏置
+        w1 = w1.view(batch_size, self.n_agents, self.mixing_embed_dim)  # [batch_size, n_agents, mixing_embed_dim]
+        b1 = b1.view(batch_size, 1, self.mixing_embed_dim)  # [batch_size, 1, mixing_embed_dim]
         
         # 4.2 应用权重到智能体Q值
-        weighted_qs = (agent_qs.view(-1, 1, self.n_agents) * 
-                      final_weights.view(-1, 1, self.n_agents))
+        weighted_qs = agent_qs.unsqueeze(1)  # [batch_size, 1, n_agents]
+        weighted_qs = weighted_qs * final_weights.unsqueeze(1)  # [batch_size, 1, n_agents]
         
         # 4.3 第一层混合
         hidden = F.elu(torch.bmm(weighted_qs, w1) + b1)  # [batch_size, 1, mixing_embed_dim]
         
         # 4.4 生成第二层的权重和偏置
-        w2 = self.hyper_w2(states).view(-1, self.mixing_embed_dim, 1)
-        b2 = self.hyper_b2(states).view(-1, 1, 1)
+        w2 = self.hyper_w2(states)  # [batch_size, mixing_embed_dim]
+        b2 = self.hyper_b2(states)  # [batch_size, 1]
+        
+        w2 = w2.view(batch_size, self.mixing_embed_dim, 1)  # [batch_size, mixing_embed_dim, 1]
+        b2 = b2.view(batch_size, 1, 1)  # [batch_size, 1, 1]
         
         # 4.5 第二层混合得到最终Q值
         q_total = torch.bmm(hidden, w2) + b2  # [batch_size, 1, 1]
         q_total = q_total.view(batch_size, -1)  # [batch_size, 1]
+        
+        # 打印每个智能体的贡献占比
+        with torch.no_grad():
+            contributions = (weighted_qs.squeeze() * w1.mean(dim=2)).sum(dim=1)
+            total_contribution = contributions.abs().sum()
+            if total_contribution > 0:
+                relative_contributions = contributions / total_contribution
+                
+                print("\n智能体贡献占比:")
+                for i in range(self.n_agents):
+                    contribution = relative_contributions[i].item() * 100
+                    agent_type = "恶意" if self.malicious_mask[i] < 0 else "正常"
+                    print(f"智能体 {i} ({agent_type}): {contribution:.2f}%")
+                print("-" * 40)
         
         return q_total
 
