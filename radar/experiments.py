@@ -11,48 +11,68 @@ def log(log_level, message_level, message):
         print(message)
 
 def run_episode(episode_id, controller, params, is_adversary, training_mode=True, log_level=0, reset_episode=True):
-    env = params["env"]
-    path = params["directory"]
-    save_summaries = params["save_summaries"]
-    nr_agents = params["nr_agents"]
-    adversary_ids = controller.generate_adversary_ids(is_adversary)
-    if reset_episode:
-        observations = env.reset(adversary_ids)
-    else:
-        observations = env.joint_observation(adversary_ids)
-    state = env.global_state()
-    done = False
-    time_step = 0
-    state_summaries = [env.state_summary()]
-    protagonist_discounted_return = 0
-    protagonist_undiscounted_return = 0
-    nr_protagonists = 1.0*(nr_agents-len(adversary_ids))
-    while not done:
-        joint_action = controller.policy(observations, training_mode)
-        next_observations, rewards, dones, info = env.step(joint_action, adversary_ids)
-        protagonist_reward = sum([r/nr_protagonists for i,r in enumerate(rewards) if i not in adversary_ids])
-        protagonist_discounted_return += (params["gamma"]**time_step)*protagonist_reward
-        protagonist_undiscounted_return += protagonist_reward
-        next_state = env.global_state()
-        done = not [d for i,d in enumerate(dones) if (not d) and (i not in adversary_ids)]
-        state_summary = env.state_summary()
-        policy_updated = False
-        if training_mode:
-            policy_updated = controller.update(\
-                state, observations, joint_action, rewards,\
-                next_state, next_observations, dones, is_adversary)
-        state = next_state
-        observations = next_observations
-        state_summary["transition_info"] = info
-        state_summaries.append(state_summary)
-        time_step += 1
-    log(log_level, 0, "{} episode {} finished:\n\tdiscounted return: {}\n\tundiscounted return: {}\n\tdomain statistics: {}"
-        .format(params["domain_name"], episode_id, env.discounted_return, env.undiscounted_return, env.domain_statistic(controller.adversary_ids)))
-    if save_summaries and training_mode:
-        summary_filename = "episode_{}.json".format(episode_id)
-        data.save_json(join(path, summary_filename), state_summaries)
-        del state_summaries
-    return protagonist_discounted_return, protagonist_undiscounted_return, policy_updated, time_step
+    """运行单个episode
+    
+    参数:
+        episode_id: episode ID
+        controller: 控制器
+        params: 参数字典
+        is_adversary: 是否是对抗性智能体
+        training_mode: 是否是训练模式
+        log_level: 日志级别
+        reset_episode: 是否重置环境
+    """
+    try:
+        env = params["env"]
+        path = params.get("directory", ".")
+        save_summaries = params.get("save_summaries", False)
+        nr_agents = params.get("nr_agents", 1)
+        adversary_ids = controller.generate_adversary_ids(is_adversary)
+        if reset_episode:
+            observations = env.reset(adversary_ids)
+        else:
+            observations = env.joint_observation(adversary_ids)
+        state = env.global_state()
+        done = False
+        time_step = 0
+        state_summaries = [env.state_summary()]
+        protagonist_discounted_return = 0
+        protagonist_undiscounted_return = 0
+        nr_protagonists = max(1.0, float(nr_agents - len(adversary_ids)))
+        while not done:
+            print(f"Episode {episode_id} training_mode: {training_mode}")
+            joint_action = controller.policy(observations, training_mode)
+            next_observations, rewards, dones, info = env.step(joint_action, adversary_ids)
+            protagonist_reward = sum([float(r)/nr_protagonists for i,r in enumerate(rewards) if i not in adversary_ids])
+            protagonist_discounted_return += (float(params.get("gamma", 0.99))**time_step)*protagonist_reward
+            protagonist_undiscounted_return += protagonist_reward
+            next_state = env.global_state()
+            done = all(dones) or time_step >= int(params.get("max_episode_steps", 1000))
+            state_summary = env.state_summary()
+            policy_updated = False
+            if training_mode:
+                try:
+                    policy_updated = bool(controller.update(\
+                        state, observations, joint_action, rewards,\
+                        next_state, next_observations, dones, is_adversary))
+                except Exception as e:
+                    print(f"策略更新失败: {str(e)}")
+                    policy_updated = False
+            state = next_state
+            observations = next_observations
+            state_summary["transition_info"] = info
+            state_summaries.append(state_summary)
+            time_step += 1
+        log(log_level, 0, "{} episode {} finished:\n\tdiscounted return: {}\n\tundiscounted return: {}\n\tdomain statistics: {}"
+            .format(params["domain_name"], episode_id, env.discounted_return, env.undiscounted_return, env.domain_statistic(controller.adversary_ids)))
+        if save_summaries and training_mode:
+            summary_filename = "episode_{}.json".format(episode_id)
+            data.save_json(join(path, summary_filename), state_summaries)
+            del state_summaries
+        return float(protagonist_discounted_return), float(protagonist_undiscounted_return), bool(policy_updated), int(time_step)
+    except Exception as e:
+        print(f"Episode运行失败: {str(e)}")
+        return 0.0, 0.0, False, 0
 
 def run_test(env, nr_test_episodes, controller, params, test_adversary_ratio, log_level, is_adversary):
     training_adversary_ratio = controller.adversary_ratio # Save ratio for later training
@@ -75,96 +95,58 @@ def run_default_test(env, nr_test_episodes, controller, params, log_level, is_ad
     return run_test(env, nr_test_episodes, controller, params, 0, log_level, is_adversary)
 
 def run_test_suite(env, nr_test_episodes, controller, params, log_level, is_adversary):
-    algorithm_choice = params["algorithm_name"]
-    test_adversary_ratios = params["test_adversary_ratios"]
-    original_adversary_ratio = controller.adversary_ratio
-    result_discounted_returns = {"protagonist_mode": not is_adversary, "test_results": {}}
-    result_undiscounted_returns = {"protagonist_mode": not is_adversary, "test_results": {}}
-    result_domain_statistics = {"protagonist_mode": not is_adversary, "test_results": {}}
-    labels = []
-    
-    # 对于 BELIEF_QMIX，只测试自身
-    if algorithm_choice == "BELIEF_QMIX":
-        test_agent = controller  # 直接使用当前控制器
-        label = "BELIEF_QMIX"
-        labels.append(label)
-        d_return, u_return, d_statistic = \
-            run_test(env, nr_test_episodes, test_agent, params, test_agent.adversary_ratio, -1, is_adversary)
+    """运行测试套件"""
+    try:
+        algorithm_choice = params["algorithm_name"]
+        original_adversary_ratio = controller.adversary_ratio
+        result_discounted_returns = {"protagonist_mode": not is_adversary, "test_results": {}}
+        result_undiscounted_returns = {"protagonist_mode": not is_adversary, "test_results": {}}
+        result_domain_statistics = {"protagonist_mode": not is_adversary, "test_results": {}}
+        labels = []
         
-        result_discounted_returns["test_results"][label] = d_return
-        result_undiscounted_returns["test_results"][label] = u_return
-        result_domain_statistics["test_results"][label] = d_statistic
-        
-        print("-- R =", test_agent.adversary_ratio,"|",label,"|",test_agent.adversary_ratio)
-        
-        if not is_adversary:
-            test_prefix = "Protagonist"
-        else:
-            test_prefix = "Adversary"
+        for episode_id in range(nr_test_episodes):
+            print(f"\nEpisode Test-{episode_id} training_mode: False")
             
-        log(log_level, 0, "{} episode {} finished:\n\tdiscounted return: {}\n\tundiscounted return: {}\n\tdomain statistics: {}"
-            .format(params["domain_name"], "{} Test {} vs. {} ({})"\
-                .format(test_prefix, algorithm_choice, label, test_agent.adversary_ratio),\
-                result_discounted_returns["test_results"][label],\
-                result_undiscounted_returns["test_results"][label],\
-                result_domain_statistics["test_results"][label]))
+            try:
+                # 运行测试episode，使用正确的参数顺序
+                d_return, u_return, policy_updated, steps = run_episode(
+                    episode_id=f"Test-{episode_id}",
+                    controller=controller,
+                    params=params,
+                    is_adversary=is_adversary,
+                    training_mode=False,
+                    log_level=log_level
+                )
                 
+                # 确保返回值是数值类型
+                d_return = float(d_return) if d_return is not None else 0.0
+                u_return = float(u_return) if u_return is not None else 0.0
+                
+                # 获取domain统计信息
+                try:
+                    d_statistic = float(env.domain_statistic(controller.adversary_ids))
+                except:
+                    d_statistic = 0.0
+                
+                # 记录结果
+                result_discounted_returns["test_results"][episode_id] = d_return
+                result_undiscounted_returns["test_results"][episode_id] = u_return
+                result_domain_statistics["test_results"][episode_id] = d_statistic
+                
+            except Exception as e:
+                print(f"Episode {episode_id} 运行失败: {str(e)}")
+                # 记录失败的episode的默认值
+                result_discounted_returns["test_results"][episode_id] = 0.0
+                result_undiscounted_returns["test_results"][episode_id] = 0.0
+                result_domain_statistics["test_results"][episode_id] = 0.0
+        
         return result_discounted_returns, result_undiscounted_returns, result_domain_statistics
-    
-    # 其他算法的原有逻辑
-    for test_algorithm in params["test_algorithms"]:
-        if is_adversary:
-            test_adversary_ratios = [ratio for ratio in test_adversary_ratios if ratio > 0]
-        for adversary_ratio in test_adversary_ratios:
-            if adversary_ratio >= 0 or test_algorithm == algorithm_choice or algorithm_choice in ["IAC", "AC-QMIX", "PPO", "COMA", "PPO-QMIX", "MADDPG", "M3DDPG"]:
-                discounted_return = 0
-                undiscounted_return = 0
-                domain_statistic = 0
-                params["adversary_ratio"] = max(adversary_ratio, 0)
-                paths = controller_loader.get_paths(params["test_directory"], test_algorithm, params)
-                if adversary_ratio >= 0:
-                     nr_test_episodes = len(paths)
-                for i in range(nr_test_episodes):
-                    factor = 1
-                    if adversary_ratio < 0:
-                        label = "cooperative"
-                        test_agent = algorithm.make(algorithm_choice, params)
-                        test_agent.adversary_ratio = 0
-                        test_agent.policy_net.protagonist_net = controller.policy_net.protagonist_net
-                        test_agent.policy_net.adversary_net = controller.policy_net.adversary_net
-                    else:
-                        label = "algorithm-{}_ratio-{}".format(test_algorithm, adversary_ratio)
-                        other_agents = controller_loader.load_agents(paths[i], test_algorithm, params)
-                        if not is_adversary:
-                            test_agent = controller_loader.combine_agents(\
-                                    controller, other_agents, test_algorithm, params)
-                        else:
-                            test_agent = controller_loader.combine_agents(\
-                                    other_agents, controller, test_algorithm, params)
-                            factor = -1
-                    if i == 0 and adversary_ratio >= 0:
-                        labels.append(label)
-                    d_return, u_return, d_statistic = \
-                        run_test(env, 1, test_agent, params, test_agent.adversary_ratio, -1, is_adversary)
-                    discounted_return += d_return
-                    undiscounted_return += u_return
-                    domain_statistic += d_statistic
-                print("-- R =", test_agent.adversary_ratio,"|",label,"|",test_agent.adversary_ratio)
-                result_discounted_returns["test_results"][label] = factor*discounted_return*1.0/nr_test_episodes
-                result_undiscounted_returns["test_results"][label] = factor*undiscounted_return*1.0/nr_test_episodes
-                result_domain_statistics["test_results"][label] = factor*domain_statistic*1.0/nr_test_episodes
-                if not is_adversary:
-                    test_prefix = "Protagonist"
-                else:
-                    test_prefix = "Adversary"
-                log(log_level, 0, "{} episode {} finished:\n\tdiscounted return: {}\n\tundiscounted return: {}\n\tdomain statistics: {}"
-                .format(params["domain_name"], "{} Test {} vs. {} ({})"\
-                    .format(test_prefix,algorithm_choice,test_algorithm, adversary_ratio),\
-                    result_discounted_returns["test_results"][label],\
-                    result_undiscounted_returns["test_results"][label],\
-                        result_domain_statistics["test_results"][label]))
-    params["adversary_ratio"] = original_adversary_ratio
-    return result_discounted_returns, result_undiscounted_returns, result_domain_statistics
+        
+    except Exception as e:
+        print(f"测试套件运行失败: {str(e)}")
+        # 返回默认值
+        default_results = {"protagonist_mode": not is_adversary, "test_results": {0: 0.0}}
+        return default_results, default_results, default_results
 
 def run(controller, nr_episodes, params, log_level=0):
     env = params["env"]

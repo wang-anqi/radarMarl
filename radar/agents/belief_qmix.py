@@ -35,16 +35,19 @@ class BeliefQMIXLearner:
         self.min_adversaries = params.get("min_adversaries", 1)  # 最小对抗者数量
         self.max_adversaries = params.get("max_adversaries", self.n_agents - 1)  # 最大对抗者数量
         
-        # 初始化RNN状态和masks，添加更大的随机性
+        # 初始化RNN状态和masks
         hidden_size = params.get("hidden_sizes", [64, 64])[-1]
-        self.belief_rnn_states = torch.randn(
-            self.n_agents,  # batch_size
-            hidden_size,  # hidden_size
-            dtype=torch.float
-        ).to(self.device) * 0.5  # 增加初始值的方差
+        self.belief_rnn_states = torch.zeros(
+            1,  # batch_size
+            self.n_agents,  # number of agents
+            hidden_size  # hidden_size
+        ).to(self.device)
         
-        # 随机初始化masks，使用更大的随机性
-        self.masks = torch.bernoulli(torch.rand(self.n_agents, 1) * 0.8 + 0.1).to(self.device)
+        # 初始化masks，确保维度正确
+        self.masks = torch.ones(1, self.n_agents, 1).to(self.device)
+        
+        # 初始化prev_belief_probs
+        self.prev_belief_probs = torch.ones(1, self.n_agents).to(self.device) * 0.5
         
         # 初始化QMIX网络
         self.qmix_net = QMixNet(
@@ -76,16 +79,15 @@ class BeliefQMIXLearner:
         # 复制参数到目标网络
         self.target_qmix_net.load_state_dict(self.qmix_net.state_dict())
         
-        # 初始化优化器，使用更大的学习率
-        self.qmix_optimizer = torch.optim.Adam(
-            self.qmix_net.parameters(),
-            lr=params.get("learning_rate", 0.001)
-        )
+        # 添加梯度裁剪参数
+        self.grad_clip = 10.0
+        # 调整学习率
+        self.belief_optimizer = torch.optim.Adam(self.belief_net.parameters(), lr=0.001)
+        self.qmix_optimizer = torch.optim.Adam(self.qmix_net.parameters(), lr=0.001)
         
-        self.belief_optimizer = torch.optim.Adam(
-            self.belief_net.parameters(),
-            lr=params.get("belief_learning_rate", 0.005)  # 增加信念网络的学习率
-        )
+        # 添加信念更新计数器
+        self.belief_update_counter = 0
+        self.min_belief_updates = 1000  # 最小更新次数
         
         # 经验回放缓冲区设置
         self.memory_capacity = params.get("memory_capacity", 20000)
@@ -103,27 +105,83 @@ class BeliefQMIXLearner:
         # 恶意智能体设置
         self.malicious_agents = []
         
+        # 打印初始化信息
         print("\n初始化信念QMIX学习器:")
         print(f"智能体数量: {self.n_agents}")
         print(f"信念阈值: {self.belief_threshold}")
         print(f"目标网络更新间隔: {self.target_update_interval}")
-        print(f"设备: {self.device}\n")
+        print(f"设备: {self.device}")
+        print(f"RNN状态形状: {self.belief_rnn_states.shape}")
+        print(f"Masks形状: {self.masks.shape}")
+        print(f"初始信念值形状: {self.prev_belief_probs.shape}\n")
     
-    def update_beliefs(self, observations, rnn_states, masks):
-        """
-        更新智能体类型的信念值
-        
-        参数:
-            observations: 观察值 [batch_size, n_agents, obs_dim]
-            rnn_states: RNN隐藏状态
-            masks: 智能体掩码
+    def update_belief_states(self, observations, masks):
+        """更新信念状态"""
+        try:
+            # 确保observations是tensor并且维度正确
+            if not isinstance(observations, torch.Tensor):
+                observations = torch.FloatTensor(observations).to(self.device)
             
-        返回:
-            beliefs: 更新后的信念值
-            new_rnn_states: 新的RNN隐藏状态
-        """
-        beliefs, new_rnn_states = self.belief_net(observations, rnn_states, masks)
-        return beliefs, new_rnn_states
+            # 添加batch维度如果需要
+            if observations.dim() == 2:
+                observations = observations.unsqueeze(0)  # [1, n_agents, obs_dim]
+            
+            # 确保masks维度正确
+            if masks is None:
+                masks = torch.ones(1, self.n_agents, 1).to(self.device)
+            else:
+                if not isinstance(masks, torch.Tensor):
+                    masks = torch.FloatTensor(masks).to(self.device)
+                if masks.dim() == 2:
+                    masks = masks.unsqueeze(0)
+            
+            # 获取当前belief
+            with torch.no_grad():
+                belief_probs, new_rnn_states = self.belief_net(
+                    observations,
+                    self.belief_rnn_states,
+                    masks
+                )
+            
+            # 确保belief_probs和rnn_states不为None
+            if belief_probs is None:
+                belief_probs = self.prev_belief_probs
+            if new_rnn_states is not None:
+                self.belief_rnn_states = new_rnn_states
+            
+            # 确保belief_probs是正确的形状 [batch_size, n_agents]
+            if belief_probs.dim() > 2:
+                belief_probs = belief_probs.mean(dim=-1)
+            if belief_probs.dim() == 1:
+                belief_probs = belief_probs.unsqueeze(0)
+            
+            # 使用简单的平滑更新
+            alpha = 0.8
+            belief_probs = alpha * belief_probs + (1 - alpha) * self.prev_belief_probs
+            
+            # 更新历史信念值
+            self.prev_belief_probs = belief_probs.detach()
+            
+            # 打印调试信息
+            if self.train_steps % 100 == 0:
+                print("\n信念更新信息:")
+                print(f"信念值形状: {belief_probs.shape}")
+                print(f"信念值范围: [{belief_probs.min().item():.4f}, {belief_probs.max().item():.4f}]")
+                print(f"信念值均值: {belief_probs.mean().item():.4f}")
+                print(f"信念值标准差: {belief_probs.std().item():.4f}")
+                print("-" * 40)
+            
+            return belief_probs
+            
+        except Exception as e:
+            print(f"更新信念状态时出错: {str(e)}")
+            print(f"错误发生时的状态:")
+            print(f"observations shape: {observations.shape if isinstance(observations, torch.Tensor) else 'N/A'}")
+            print(f"masks shape: {masks.shape if isinstance(masks, torch.Tensor) else 'N/A'}")
+            print(f"belief_rnn_states shape: {self.belief_rnn_states.shape if isinstance(self.belief_rnn_states, torch.Tensor) else 'N/A'}")
+            
+            # 返回默认信念值
+            return self.prev_belief_probs.clone()
     
     def get_q_values(self, agent_qs, states, beliefs):
         """
@@ -139,7 +197,7 @@ class BeliefQMIXLearner:
         """
         return self.qmix_net(agent_qs, states, beliefs)
     
-    def train(self, batch):
+    def train(self, batch, t_env, episode):
         """
         训练QMIX和信念网络
         
@@ -187,33 +245,29 @@ class BeliefQMIXLearner:
         # QMIX损失
         qmix_loss = F.mse_loss(current_q_total, target_q_total)
         
-        # 信念损失（包含多个组件）
-        # 1. 基础信念损失
-        belief_base_loss = F.binary_cross_entropy(beliefs, torch.zeros_like(beliefs))
+        # 计算信念损失
+        belief_loss = self.compute_belief_loss(batch)
         
-        # 2. 信念一致性损失（确保信念变化平滑）
-        belief_consistency_loss = F.mse_loss(beliefs, next_beliefs)
+        # 应用梯度裁剪
+        torch.nn.utils.clip_grad_norm_(self.belief_net.parameters(), self.grad_clip)
         
-        # 3. 信念稀疏性损失（鼓励更确定的信念）
-        belief_sparsity_loss = torch.mean(torch.abs(beliefs - 0.5))
+        # 更新信念网络
+        self.belief_optimizer.zero_grad()
+        belief_loss.backward()
+        self.belief_optimizer.step()
         
-        # 组合信念损失
-        belief_loss = (belief_base_loss + 
-                      0.1 * belief_consistency_loss + 
-                      0.1 * belief_sparsity_loss)
+        self.belief_update_counter += 1
         
+        # 只有在足够的更新次数后才开始使用信念值
+        if self.belief_update_counter < self.min_belief_updates:
+            return
+            
         # 更新网络
         # 1. 更新QMIX网络
         self.qmix_optimizer.zero_grad()
         qmix_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.qmix_net.parameters(), 1.0)  # 梯度裁剪
         self.qmix_optimizer.step()
-        
-        # 2. 更新信念网络
-        self.belief_optimizer.zero_grad()
-        belief_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.belief_net.parameters(), 1.0)  # 梯度裁剪
-        self.belief_optimizer.step()
         
         # 定期更新目标网络
         self.train_steps += 1
@@ -222,10 +276,7 @@ class BeliefQMIXLearner:
         
         return {
             'qmix_loss': qmix_loss.item(),
-            'belief_loss': belief_loss.item(),
-            'belief_base_loss': belief_base_loss.item(),
-            'belief_consistency_loss': belief_consistency_loss.item(),
-            'belief_sparsity_loss': belief_sparsity_loss.item()
+            'belief_loss': belief_loss.item()
         }
     
     def save(self, path):
@@ -251,9 +302,7 @@ class BeliefQMIXLearner:
     def generate_adversary_ids(self, is_adversary):
         """基于belief机制生成对抗者ID列表"""
         print("\n" + "-"*50)
-        print("Generating Adversary IDs using Belief Mechanism:")
-        print(f"Current adversary ratio: {self.adversary_ratio}")
-        print(f"Current adversaries: {self.adversary_ids}")
+        print("基于信念机制识别对抗性智能体:")
         
         # 获取当前环境观察
         observations = self.params["env"].joint_observation([])
@@ -266,51 +315,60 @@ class BeliefQMIXLearner:
         )
         
         # 将belief值转换为numpy数组并计算每个智能体的平均belief值
-        belief_probs = belief_probs.detach().numpy()
-        agent_beliefs = [(i, float(belief_probs[i].mean())) for i in range(self.n_agents)]
+        belief_probs = belief_probs.detach().cpu().numpy()
+        if len(belief_probs.shape) > 2:  # 如果维度大于2，取平均
+            belief_probs = belief_probs.mean(axis=-1)
         
-        # 打印每个智能体的belief值
-        print("\nAgent Belief Values:")
-        for agent_id, belief in agent_beliefs:
-            print(f"Agent {agent_id}: {belief:.4f}")
+        # 确保belief_probs是二维的 [batch_size, n_agents]
+        if len(belief_probs.shape) == 1:
+            belief_probs = belief_probs.reshape(1, -1)
+            
+        # 计算每个智能体的平均belief值
+        agent_beliefs = [(i, float(belief_probs[0, i])) for i in range(self.n_agents)]
         
-        # 根据belief阈值选择对抗者
-        old_adversaries = self.adversary_ids.copy()
-        self.adversary_ids = []
+        # 打印每个智能体的信息
+        print("\n智能体信念状态:")
         for agent_id, belief in agent_beliefs:
-            if belief > self.belief_threshold:
-                self.adversary_ids.append(agent_id)
+            print(f"智能体 {agent_id}:")
+            print(f"  - 信念值: {belief:.4f} (越高表示越可能是对抗性智能体)")
+            print(f"  - 当前状态: {'可能是对抗性' if belief > self.belief_threshold else '正常'}")
+        
+        # 根据belief阈值识别对抗者
+        self.adversary_ids = [
+            agent_id for agent_id, belief in agent_beliefs 
+            if belief > self.belief_threshold
+        ]
         
         # 确保对抗者数量在合理范围内
-        if is_adversary:
-            while len(self.adversary_ids) < self.min_adversaries:
-                remaining = [a for a, _ in agent_beliefs if a not in self.adversary_ids]
-                if not remaining:
-                    break
-                self.adversary_ids.append(remaining[0])
+        if len(self.adversary_ids) < self.min_adversaries:
+            # 如果检测到的对抗者太少，添加得分最高的智能体
+            remaining_agents = sorted(
+                [(i, b) for i, b in agent_beliefs if i not in self.adversary_ids],
+                key=lambda x: x[1],
+                reverse=True
+            )
+            additional_agents = [
+                agent_id for agent_id, _ in remaining_agents[:self.min_adversaries - len(self.adversary_ids)]
+            ]
+            self.adversary_ids.extend(additional_agents)
+        elif len(self.adversary_ids) > self.max_adversaries:
+            # 如果检测到的对抗者太多，只保留得分最高的
+            agent_scores = sorted(
+                [(i, b) for i, b in agent_beliefs if i in self.adversary_ids],
+                key=lambda x: x[1],
+                reverse=True
+            )
+            self.adversary_ids = [agent_id for agent_id, _ in agent_scores[:self.max_adversaries]]
         
-        if len(self.adversary_ids) > self.max_adversaries:
-            self.adversary_ids = self.adversary_ids[:self.max_adversaries]
-        
-        # 更新masks和对抗者比例
-        self.masks = torch.ones(self.n_agents, 1).to(self.device)
-        for agent_id in self.adversary_ids:
-            self.masks[agent_id] = 0
-            
-        # 更新对抗者比例
-        self.adversary_ratio = len(self.adversary_ids) / self.n_agents if self.n_agents > 0 else 0.0
-        
-        # 打印变化信息
-        print("\nAdversary Changes:")
-        print(f"Previous adversaries: {old_adversaries}")
-        print(f"New adversaries: {self.adversary_ids}")
-        print(f"New adversary ratio: {self.adversary_ratio:.4f}")
-        print("-"*50 + "\n")
+        print(f"\n信念阈值: {self.belief_threshold:.4f}")
+        print(f"识别出的对抗性智能体: {self.adversary_ids}")
+        print(f"对抗性智能体数量: {len(self.adversary_ids)}/{self.n_agents}")
+        print("-"*50)
         
         return self.adversary_ids
         
     def sample_adversary_ratio(self):
-        """在信念机制中，根据belief值动态确定对抗者"""
+        """基于信念值动态确定对抗者比例"""
         # 获取当前环境观察
         observations = self.params["env"].joint_observation([])
         
@@ -326,83 +384,75 @@ class BeliefQMIXLearner:
         belief_probs = belief_probs.detach().numpy()
         agent_beliefs = [(i, float(belief_probs[i].mean())) for i in range(self.n_agents)]
         
-        # 根据belief阈值选择对抗者
+        # 根据belief阈值识别对抗者
         self.adversary_ids = [
             agent_id for agent_id, belief in agent_beliefs 
             if belief > self.belief_threshold
         ]
         
-        # 确保对抗者数量在合理范围内
-        if len(self.adversary_ids) < self.min_adversaries:
-            agent_beliefs.sort(key=lambda x: x[1], reverse=True)
-            remaining = [a for a, _ in agent_beliefs if a not in self.adversary_ids]
-            while len(self.adversary_ids) < self.min_adversaries and remaining:
-                self.adversary_ids.append(remaining.pop(0))
-                
-        if len(self.adversary_ids) > self.max_adversaries:
-            self.adversary_ids = self.adversary_ids[:self.max_adversaries]
-        
-        # 更新masks和对抗者比例
+        # 更新masks
         self.masks = torch.ones(self.n_agents, 1).to(self.device)
         for agent_id in self.adversary_ids:
             self.masks[agent_id] = 0
-            
-        # 更新并返回对抗者比例
+        
+        # 计算当前对抗者比例
         self.adversary_ratio = len(self.adversary_ids) / self.n_agents if self.n_agents > 0 else 0.0
         return self.adversary_ratio
 
-    def update_belief_states(self, observations, rewards):
-        """根据观察和奖励更新belief状态"""
-        # 获取新的belief值
-        with torch.no_grad():
-            belief_probs, new_belief_rnn_states = self.belief_net(
-                observations,
-                self.belief_rnn_states,
-                self.masks
-            )
-        
-        # 更新RNN状态
-        self.belief_rnn_states = new_belief_rnn_states
-        
-        return belief_probs
-
     def get_agent_qvals(self, observations):
         """获取每个智能体的Q值"""
-        # 将观察转换为张量
-        obs_tensor = torch.FloatTensor(observations).to(self.device)  # [n_agents, obs_dim]
-        
-        # 创建一个批次的观察
-        batch_obs = obs_tensor.unsqueeze(0)  # [1, n_agents, obs_dim]
-        
-        # 创建对应的状态和信念
-        batch_state = torch.zeros(1, np.prod(self.state_shape)).to(self.device)  # [1, state_dim]
-        batch_belief = torch.zeros(1, self.n_agents).to(self.device)  # [1, n_agents]
-        
-        # 使用QMIX网络计算Q值
-        with torch.no_grad():
-            # 为每个动作计算Q值
-            q_values = torch.zeros(self.n_agents, self.n_actions).to(self.device)
+        try:
+            # 将观察转换为张量
+            if not isinstance(observations, torch.Tensor):
+                obs_tensor = torch.FloatTensor(observations).to(self.device)  # [n_agents, obs_dim]
+            else:
+                obs_tensor = observations.to(self.device)
             
-            # 对每个动作进行评估
-            for action in range(self.n_actions):
-                # 创建动作张量
-                action_tensor = torch.full((1, self.n_agents), action, dtype=torch.long).to(self.device)
+            # 创建一个批次的观察
+            batch_obs = obs_tensor.unsqueeze(0) if obs_tensor.dim() == 2 else obs_tensor  # [1, n_agents, obs_dim]
+            
+            # 创建对应的状态和信念
+            batch_state = torch.zeros(1, np.prod(self.state_shape)).to(self.device)  # [1, state_dim]
+            batch_belief = torch.zeros(1, self.n_agents).to(self.device)  # [1, n_agents]
+            
+            # 使用QMIX网络计算Q值
+            with torch.no_grad():
+                # 为每个动作计算Q值
+                q_values = torch.zeros(self.n_agents, self.n_actions).to(self.device)
                 
-                # 创建每个智能体的Q值
-                agent_qs = torch.zeros(1, self.n_agents).to(self.device)
-                agent_qs[0] = q_values[:, action]  # 使用当前动作的Q值
-                
-                # 计算联合Q值
-                joint_q_value = self.qmix_net.forward(
-                    agent_qs,  # [batch_size, n_agents]
-                    batch_state,  # [batch_size, state_dim]
-                    batch_belief  # [batch_size, n_agents]
-                )
-                
-                # 将Q值分配给对应的动作
-                q_values[:, action] = joint_q_value.squeeze() / self.n_agents
-        
-        return q_values
+                # 对每个动作进行评估
+                for action in range(self.n_actions):
+                    # 创建动作张量
+                    action_tensor = torch.full((1, self.n_agents), action, dtype=torch.long).to(self.device)
+                    
+                    # 创建每个智能体的Q值
+                    agent_qs = torch.zeros(1, self.n_agents).to(self.device)
+                    agent_qs[0] = q_values[:, action]  # 使用当前动作的Q值
+                    
+                    # 计算联合Q值
+                    try:
+                        joint_q_value = self.qmix_net.forward(
+                            agent_qs,  # [batch_size, n_agents]
+                            batch_state,  # [batch_size, state_dim]
+                            batch_belief  # [batch_size, n_agents]
+                        )
+                        
+                        # 将Q值分配给对应的动作
+                        if joint_q_value is not None:
+                            q_values[:, action] = joint_q_value.squeeze() / max(1, self.n_agents)
+                        else:
+                            q_values[:, action] = torch.zeros(self.n_agents).to(self.device)
+                            
+                    except Exception as e:
+                        print(f"计算Q值时出错: {str(e)}")
+                        q_values[:, action] = torch.zeros(self.n_agents).to(self.device)
+            
+            return q_values
+            
+        except Exception as e:
+            print(f"获取智能体Q值时出错: {str(e)}")
+            # 返回默认Q值
+            return torch.zeros(self.n_agents, self.n_actions).to(self.device)
 
     def get_agent_qvals_batch(self, observations, actions=None):
         """获取一批智能体的Q值
@@ -458,7 +508,14 @@ class BeliefQMIXLearner:
         return q_values
 
     def policy(self, observations, training_mode=True):
-        """根据当前观察生成动作"""
+        """根据当前观察生成动作
+        
+        参数:
+            observations: 观察值
+            training_mode: 是否为训练模式
+        返回:
+            actions: 动作列表
+        """
         # 更新belief状态
         belief_probs = self.update_belief_states(observations, None)
         
@@ -485,7 +542,7 @@ class BeliefQMIXLearner:
               next_state, next_observations, dones, is_adversary):
         """更新网络参数"""
         # 更新belief状态
-        belief_probs = self.update_belief_states(observations, rewards)
+        belief_probs = self.update_belief_states(observations, None)
         
         # 如果belief_probs是3维，取平均值转换为2维
         if len(belief_probs.shape) == 3:
@@ -587,3 +644,152 @@ class BeliefQMIXLearner:
         self.qmix_net.set_malicious_agents(agent_indices)
         self.target_qmix_net.set_malicious_agents(agent_indices)
         print(f"\n已设置恶意智能体: {agent_indices}")
+
+    def compute_belief_loss(self, batch):
+        """改进的信念损失计算，增加差异化训练信号"""
+        try:
+            # 获取batch中的观察和奖励
+            observations = batch.get('obs', torch.zeros(1, self.n_agents, self.obs_shape))
+            rewards = batch.get('reward', torch.zeros(1, self.n_agents))
+            actions = batch.get('actions', torch.zeros(1, self.n_agents))
+            
+            # 确保数据类型正确
+            if not isinstance(observations, torch.Tensor):
+                observations = torch.FloatTensor(observations).to(self.device)
+            if not isinstance(rewards, torch.Tensor):
+                rewards = torch.FloatTensor(rewards).to(self.device)
+            if not isinstance(actions, torch.Tensor):
+                actions = torch.FloatTensor(actions).to(self.device)
+            
+            # 计算信念值
+            beliefs, _ = self.belief_net(observations, None, None)
+            
+            # 确保beliefs不为None且维度正确
+            if beliefs is None or beliefs.nelement() == 0:
+                beliefs = torch.ones(observations.size(0), self.n_agents).to(self.device) * 0.5
+            
+            # 1. 基于奖励的自监督损失 - 使用相对奖励
+            batch_rewards = rewards.view(-1, self.n_agents)
+            reward_mean = batch_rewards.mean(dim=1, keepdim=True)
+            reward_std = batch_rewards.std(dim=1, keepdim=True) + 1e-6
+            normalized_rewards = (batch_rewards - reward_mean) / reward_std
+            reward_based_target = torch.sigmoid(normalized_rewards)
+            base_loss = F.binary_cross_entropy(beliefs, reward_based_target)
+            
+            # 2. 动作差异性损失
+            action_diff = torch.abs(actions.unsqueeze(2) - actions.unsqueeze(1))
+            action_similarity = 1.0 - action_diff / self.n_actions
+            action_based_loss = F.mse_loss(beliefs, action_similarity.mean(dim=-1))
+            
+            # 3. 信念多样性损失
+            belief_mean = beliefs.mean(dim=1, keepdim=True)
+            diversity_loss = -torch.mean(torch.abs(beliefs - belief_mean))
+            
+            # 4. 时间一致性损失
+            if beliefs.size(0) > 1:
+                consistency_loss = F.mse_loss(beliefs[:-1], beliefs[1:])
+            else:
+                consistency_loss = torch.tensor(0.0).to(self.device)
+            
+            # 5. 熵正则化
+            entropy = -(beliefs * torch.log(beliefs + 1e-10) + 
+                       (1 - beliefs) * torch.log(1 - beliefs + 1e-10)).mean()
+            
+            # 6. 对抗性检测损失 - 基于观察差异
+            obs_diff = torch.cdist(observations.view(observations.size(0), self.n_agents, -1), 
+                                 observations.view(observations.size(0), self.n_agents, -1))
+            obs_similarity = torch.exp(-obs_diff.mean(dim=-1))
+            detection_loss = F.mse_loss(beliefs, 1.0 - obs_similarity)
+            
+            # 组合所有损失，使用不同的权重
+            total_loss = (base_loss * 1.0 +
+                         action_based_loss * 0.5 +
+                         diversity_loss * 0.3 +
+                         consistency_loss * 0.2 +
+                         detection_loss * 0.4 -
+                         entropy * 0.1)  # 负号是因为我们要最大化熵
+            
+            # 打印调试信息
+            if self.train_steps % 100 == 0:
+                print(f"\n信念损失组成:")
+                print(f"基础损失: {base_loss.item():.4f}")
+                print(f"动作差异损失: {action_based_loss.item():.4f}")
+                print(f"多样性损失: {diversity_loss.item():.4f}")
+                print(f"一致性损失: {consistency_loss.item():.4f}")
+                print(f"检测损失: {detection_loss.item():.4f}")
+                print(f"熵: {entropy.item():.4f}")
+                print(f"总损失: {total_loss.item():.4f}")
+                print("-" * 40)
+            
+            return total_loss
+            
+        except Exception as e:
+            print(f"计算信念损失时出错: {str(e)}")
+            return torch.tensor(0.1).to(self.device)
+
+    def run_episode(self, episode_id, controller, params, is_adversary, training_mode=True, log_level=0, reset_episode=True):
+        """运行单个episode"""
+        env = params["env"]
+        path = params["directory"]
+        save_summaries = params["save_summaries"]
+        nr_agents = params["nr_agents"]
+        
+        # 初始化返回值
+        protagonist_discounted_return = 0.0
+        protagonist_undiscounted_return = 0.0
+        policy_updated = False
+        time_step = 0
+        
+        # 生成对抗者ID
+        adversary_ids = self.generate_adversary_ids(is_adversary)
+        
+        # 重置环境
+        if reset_episode:
+            observations = env.reset(adversary_ids)
+        else:
+            observations = env.joint_observation(adversary_ids)
+        
+        state = env.global_state()
+        done = False
+        
+        while not done:
+            # 获取动作
+            joint_action = self.policy(observations, training_mode)
+            
+            # 执行动作
+            next_observations, rewards, dones, info = env.step(joint_action, adversary_ids)
+            next_state = env.global_state()
+            
+            # 计算奖励
+            if len(adversary_ids) < nr_agents:
+                nr_protagonists = float(nr_agents - len(adversary_ids))
+                protagonist_reward = sum([r/nr_protagonists for i,r in enumerate(rewards) if i not in adversary_ids])
+            else:
+                protagonist_reward = 0.0
+            
+            # 更新累积奖励
+            protagonist_discounted_return += (params.get("gamma", 0.99) ** time_step) * protagonist_reward
+            protagonist_undiscounted_return += protagonist_reward
+            
+            # 更新策略
+            if training_mode:
+                policy_updated = self.update(
+                    state, 
+                    observations, 
+                    joint_action, 
+                    rewards,
+                    next_state, 
+                    next_observations, 
+                    dones, 
+                    is_adversary
+                )
+            
+            # 更新状态
+            state = next_state
+            observations = next_observations
+            time_step += 1
+            
+            # 检查是否结束
+            done = all(dones) or time_step >= params.get("max_episode_steps", 1000)
+        
+        return float(protagonist_discounted_return), float(protagonist_undiscounted_return), bool(policy_updated), int(time_step)

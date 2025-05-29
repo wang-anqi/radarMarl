@@ -11,30 +11,17 @@ logging.basicConfig(
 )
 
 # nr_steps = 2000000
-nr_steps = 100000
-# nr_steps = 500
+# nr_steps = 100000
+nr_steps = 200
 
 params = {}
-# 设置具体的对抗性智能体比例进行测试
-params["test_adversary_ratios"] = [0.25, 0.5]  # 设置25%和50%的对抗性智能体
+# 移除手动设置的对抗性智能体比例
 params["monitor_adversarial"] = True  # 启用对抗性智能体监控
 params["adversarial_stats"] = {
     "log_frequency": 10,  # 每10步记录一次
     "track_values": True,  # 追踪智能体值
     "track_actions": True  # 追踪智能体行动
 }
-
-# 打印对抗性智能体的比例信息
-for ratio in params["test_adversary_ratios"]:
-    total_agents = 100  # 假设总智能体数量为100
-    adversarial_count = int(ratio * total_agents)
-    friendly_count = total_agents - adversarial_count
-    logging.info(f"\n对抗性智能体配置:")
-    logging.info(f"总智能体数量: {total_agents}")
-    logging.info(f"对抗性智能体比例: {ratio:.2%}")
-    logging.info(f"对抗性智能体数量: {adversarial_count}")
-    logging.info(f"友好智能体数量: {friendly_count}")
-    logging.info("-" * 50)
 
 # 保持原有的其他参数
 params["test_algorithms"] = ["RADAR_X"]

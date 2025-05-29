@@ -52,7 +52,7 @@ class QMixNet(nn.Module):
             nn.Linear(self.state_dim, mixing_embed_dim),
             nn.Tanh(),
             nn.Linear(mixing_embed_dim, n_agents),
-            nn.Softmax(dim=-1)  # 确保注意力权重和为1
+            nn.Softmax(dim=-1)
         )
         
         # 信念层面的注意力网络
@@ -60,7 +60,7 @@ class QMixNet(nn.Module):
             nn.Linear(n_agents, mixing_embed_dim),
             nn.Tanh(),
             nn.Linear(mixing_embed_dim, n_agents),
-            nn.Softmax(dim=-1)  # 确保注意力权重和为1
+            nn.Softmax(dim=-1)
         )
         
         # 注意力融合网络
@@ -68,25 +68,12 @@ class QMixNet(nn.Module):
             nn.Linear(2 * n_agents, mixing_embed_dim),
             nn.ReLU(),
             nn.Linear(mixing_embed_dim, n_agents),
-            nn.Sigmoid()  # 控制融合权重在[0,1]范围内
+            nn.Sigmoid()
         )
-        
-        # 手动设置恶意智能体的掩码
-        self.malicious_mask = torch.ones(n_agents)
-
-    def set_malicious_agents(self, agent_indices):
-        """手动设置恶意智能体
-        
-        参数:
-            agent_indices: 恶意智能体的索引列表
-        """
-        self.malicious_mask = torch.ones(self.n_agents)
-        for idx in agent_indices:
-            self.malicious_mask[idx] = -1.0  # 恶意智能体的贡献将被反转
 
     def forward(self, agent_qs, states, beliefs):
         """
-        前向传播过程，并打印每个智能体的贡献
+        前向传播过程
         
         参数:
             agent_qs: 各智能体的Q值 [batch_size, n_agents]
@@ -98,11 +85,11 @@ class QMixNet(nn.Module):
         """
         # 确保输入维度正确
         if len(states.shape) == 1:
-            states = states.unsqueeze(0)  # [1, state_dim]
+            states = states.unsqueeze(0)
         if len(beliefs.shape) == 1:
-            beliefs = beliefs.unsqueeze(0)  # [1, n_agents]
+            beliefs = beliefs.unsqueeze(0)
         if len(agent_qs.shape) == 1:
-            agent_qs = agent_qs.unsqueeze(0)  # [1, n_agents]
+            agent_qs = agent_qs.unsqueeze(0)
             
         # 获取最大的batch_size
         batch_sizes = [t.size(0) for t in [agent_qs, states, beliefs]]
@@ -124,15 +111,14 @@ class QMixNet(nn.Module):
         belief_weights = self.belief_attention(beliefs)  # [batch_size, n_agents]
         
         # 1.3 融合两个层面的注意力
-        attention_concat = torch.cat([state_weights, belief_weights], dim=-1)  # [batch_size, 2*n_agents]
-        attention_weights = self.attention_fusion(attention_concat)  # [batch_size, n_agents]
+        attention_concat = torch.cat([state_weights, belief_weights], dim=-1)
+        attention_weights = self.attention_fusion(attention_concat)
         
-        # 2. 应用恶意智能体掩码
-        malicious_mask = self.malicious_mask.to(states.device)
-        defensive_weights = 1.0 - beliefs  # [batch_size, n_agents]
+        # 2. 基于信念的防御权重
+        defensive_weights = 1.0 - beliefs  # 信念值越高，防御权重越低
         
-        # 3. 最终权重：结合注意力权重、防御权重和恶意掩码
-        final_weights = attention_weights * defensive_weights * malicious_mask  # [batch_size, n_agents]
+        # 3. 最终权重：结合注意力权重和防御权重
+        final_weights = attention_weights * defensive_weights
         
         # 4. 动态权重生成（通过超网络）
         # 4.1 生成第一层的权重和偏置
@@ -171,8 +157,9 @@ class QMixNet(nn.Module):
                 print("\n智能体贡献占比:")
                 for i in range(self.n_agents):
                     contribution = relative_contributions[i].item() * 100
-                    agent_type = "恶意" if self.malicious_mask[i] < 0 else "正常"
-                    print(f"智能体 {i} ({agent_type}): {contribution:.2f}%")
+                    belief_value = beliefs[0][i].item()
+                    agent_type = "可能是对抗性" if belief_value > 0.6 else "正常"
+                    print(f"智能体 {i} ({agent_type}): {contribution:.2f}% (信念值: {belief_value:.4f})")
                 print("-" * 40)
         
         return q_total

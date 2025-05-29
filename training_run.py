@@ -45,7 +45,7 @@ else:
         print_usage()
     # 验证对抗者比例是否在有效范围内
     if not (0 <= params["adversary_ratio"] <= 1):
-        print("\n错误: 对抗者比例必须在0到1之间")
+        print("\n错误: 对抗者比例必须在0到1之间") 
         print_usage()
 
 params["test_suite"] = experiments.run_test_suite
