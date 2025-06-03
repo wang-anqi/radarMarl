@@ -29,6 +29,15 @@ class BeliefQMIXLearner:
         self.device = params.get("device", torch.device("cpu"))
         self.adversary_ratio = 0.0  # 初始化对抗者比例为0
         
+        # 初始化智能体历史信息存储
+        self.agent_history = {
+            i: {
+                'observations': [],
+                'actions': [],
+                'rewards': []
+            } for i in range(self.n_agents)
+        }
+        
         # 初始化对抗者相关参数
         self.adversary_ids = []  # 对抗者ID列表
         self.belief_threshold = params.get("belief_threshold", 0.6)  # 信念阈值
@@ -115,18 +124,101 @@ class BeliefQMIXLearner:
         print(f"Masks形状: {self.masks.shape}")
         print(f"初始信念值形状: {self.prev_belief_probs.shape}\n")
     
+    def update_history(self, observations, actions, rewards):
+        """更新智能体的历史信息，保存完整历史"""
+        for i in range(self.n_agents):
+            self.agent_history[i]['observations'].append(observations[i])
+            if actions is not None:
+                self.agent_history[i]['actions'].append(actions[i])
+            if rewards is not None:
+                self.agent_history[i]['rewards'].append(rewards[i])
+
+    def get_history_features(self):
+        """获取历史特征，使用完整历史进行分析"""
+        history_features = []
+        for i in range(self.n_agents):
+            agent_features = []
+            
+            # 处理观察历史
+            obs_history = self.agent_history[i]['observations']
+            if obs_history:
+                obs_tensor = torch.FloatTensor(obs_history).to(self.device)
+                # 计算更丰富的统计特征
+                agent_features.extend([
+                    obs_tensor.mean(dim=0),  # 平均观察
+                    obs_tensor.std(dim=0),   # 观察标准差
+                    obs_tensor[-1],          # 最新观察
+                    obs_tensor[0]            # 初始观察
+                ])
+            else:
+                # 如果没有历史，用零张量填充
+                zero_obs = torch.zeros(self.obs_shape).to(self.device)
+                agent_features.extend([zero_obs] * 4)
+            
+            # 处理动作历史
+            action_history = self.agent_history[i]['actions']
+            if action_history:
+                # 计算动作分布
+                action_counts = torch.zeros(self.n_actions).to(self.device)
+                for a in action_history:
+                    action_counts[a] += 1
+                action_dist = action_counts / len(action_history)
+                
+                # 计算动作变化频率
+                action_changes = sum(1 for j in range(1, len(action_history))
+                                   if action_history[j] != action_history[j-1])
+                change_rate = action_changes / (len(action_history) - 1) if len(action_history) > 1 else 0
+                
+                agent_features.extend([
+                    action_dist,
+                    torch.tensor([change_rate]).to(self.device)
+                ])
+            else:
+                agent_features.extend([
+                    torch.zeros(self.n_actions).to(self.device),
+                    torch.tensor([0.0]).to(self.device)
+                ])
+            
+            # 处理奖励历史
+            reward_history = self.agent_history[i]['rewards']
+            if reward_history:
+                reward_tensor = torch.FloatTensor(reward_history).to(self.device)
+                reward_features = torch.tensor([
+                    reward_tensor.mean(),                    # 平均奖励
+                    reward_tensor.std(),                     # 奖励标准差
+                    reward_tensor[-1],                       # 最新奖励
+                    reward_tensor.max(),                     # 最大奖励
+                    reward_tensor.min(),                     # 最小奖励
+                    (reward_tensor >= 0).float().mean(),     # 正奖励比例
+                    len(reward_history)                      # 历史长度
+                ]).to(self.device)
+                agent_features.append(reward_features)
+            else:
+                agent_features.append(torch.zeros(7).to(self.device))
+            
+            # 合并所有特征
+            agent_history_feature = torch.cat([f.flatten() for f in agent_features])
+            history_features.append(agent_history_feature)
+        
+        return torch.stack(history_features)
+
     def update_belief_states(self, observations, masks):
         """更新信念状态"""
         try:
-            # 确保observations是tensor并且维度正确
+            # 处理observations的维度
             if not isinstance(observations, torch.Tensor):
                 observations = torch.FloatTensor(observations).to(self.device)
             
+            # 如果是4维输入，将其展平
+            if observations.dim() == 4:
+                batch_size, channels, height, width = observations.shape
+                observations = observations.view(batch_size, -1)  # 展平为2维
+            
             # 添加batch维度如果需要
             if observations.dim() == 2:
-                observations = observations.unsqueeze(0)  # [1, n_agents, obs_dim]
+                observations = observations.unsqueeze(0)  # [1, n_agents, features]
             
-            # 确保masks维度正确
+            # 处理masks
             if masks is None:
                 masks = torch.ones(1, self.n_agents, 1).to(self.device)
             else:
@@ -135,54 +227,49 @@ class BeliefQMIXLearner:
                 if masks.dim() == 2:
                     masks = masks.unsqueeze(0)
             
-            # 获取当前belief
+            # 获取历史特征
+            history_features = self.get_history_features()  # [n_agents, history_features]
+            history_features = history_features.unsqueeze(0)  # [1, n_agents, history_features]
+            
+            # 将历史特征与当前观察结合
+            combined_input = torch.cat([
+                observations,
+                history_features
+            ], dim=-1)  # [batch_size, n_agents, total_features]
+            
+            # 更新信念
             with torch.no_grad():
                 belief_probs, new_rnn_states = self.belief_net(
-                    observations,
+                    combined_input,
                     self.belief_rnn_states,
                     masks
                 )
-            
-            # 确保belief_probs和rnn_states不为None
-            if belief_probs is None:
-                belief_probs = self.prev_belief_probs
-            if new_rnn_states is not None:
-                self.belief_rnn_states = new_rnn_states
-            
-            # 确保belief_probs是正确的形状 [batch_size, n_agents]
-            if belief_probs.dim() > 2:
-                belief_probs = belief_probs.mean(dim=-1)
-            if belief_probs.dim() == 1:
-                belief_probs = belief_probs.unsqueeze(0)
-            
-            # 使用简单的平滑更新
-            alpha = 0.8
-            belief_probs = alpha * belief_probs + (1 - alpha) * self.prev_belief_probs
-            
-            # 更新历史信念值
-            self.prev_belief_probs = belief_probs.detach()
-            
-            # 打印调试信息
-            if self.train_steps % 100 == 0:
-                print("\n信念更新信息:")
-                print(f"信念值形状: {belief_probs.shape}")
-                print(f"信念值范围: [{belief_probs.min().item():.4f}, {belief_probs.max().item():.4f}]")
-                print(f"信念值均值: {belief_probs.mean().item():.4f}")
-                print(f"信念值标准差: {belief_probs.std().item():.4f}")
-                print("-" * 40)
+                
+                if belief_probs is None:
+                    belief_probs = self.prev_belief_probs
+                
+                # 使用简单的平滑更新
+                alpha = 0.8
+                belief_probs = alpha * belief_probs + (1 - alpha) * self.prev_belief_probs
+                
+                # 更新RNN状态和历史信念值
+                if new_rnn_states is not None:
+                    self.belief_rnn_states = new_rnn_states
+                self.prev_belief_probs = belief_probs.detach()
             
             return belief_probs
             
         except Exception as e:
-            print(f"更新信念状态时出错: {str(e)}")
+            print(f"\n更新信念状态时出错: {str(e)}")
             print(f"错误发生时的状态:")
-            print(f"observations shape: {observations.shape if isinstance(observations, torch.Tensor) else 'N/A'}")
-            print(f"masks shape: {masks.shape if isinstance(masks, torch.Tensor) else 'N/A'}")
-            print(f"belief_rnn_states shape: {self.belief_rnn_states.shape if isinstance(self.belief_rnn_states, torch.Tensor) else 'N/A'}")
-            
-            # 返回默认信念值
+            print(f"observations shape: {observations.shape}")
+            print(f"masks shape: {masks.shape}")
+            print(f"belief_rnn_states shape: {self.belief_rnn_states.shape}")
+            print(f"history_features shape: {history_features.shape if 'history_features' in locals() else 'Not created'}")
+            if 'combined_input' in locals():
+                print(f"combined_input shape: {combined_input.shape}")
             return self.prev_belief_probs.clone()
-    
+
     def get_q_values(self, agent_qs, states, beliefs):
         """
         使用信念加权的QMIX获取总Q值
@@ -541,6 +628,9 @@ class BeliefQMIXLearner:
     def update(self, state, observations, joint_action, rewards, 
               next_state, next_observations, dones, is_adversary):
         """更新网络参数"""
+        # 更新历史信息
+        self.update_history(observations, joint_action, rewards)
+        
         # 更新belief状态
         belief_probs = self.update_belief_states(observations, None)
         
@@ -793,3 +883,59 @@ class BeliefQMIXLearner:
             done = all(dones) or time_step >= params.get("max_episode_steps", 1000)
         
         return float(protagonist_discounted_return), float(protagonist_undiscounted_return), bool(policy_updated), int(time_step)
+
+    def analyze_agent_contributions(self, weighted_qs, w1, beliefs):
+        """分析每个智能体的贡献度和对抗性"""
+        try:
+            with torch.no_grad():
+                # 确保维度正确
+                if weighted_qs.dim() == 2:
+                    weighted_qs = weighted_qs.unsqueeze(0)
+                if w1.dim() == 2:
+                    w1 = w1.unsqueeze(0)
+                if beliefs.dim() == 1:
+                    beliefs = beliefs.unsqueeze(0)
+                
+                # 计算每个智能体的贡献
+                contributions = (weighted_qs.squeeze() * w1.mean(dim=2)).sum(dim=1)
+                total_contribution = contributions.abs().sum()
+                
+                if total_contribution > 0:
+                    relative_contributions = contributions / total_contribution
+                    
+                    # 计算每个智能体的对抗性得分
+                    adversary_scores = torch.sigmoid(w1.mean(dim=2)).mean(dim=1)
+                    
+                    print("\n智能体贡献分析:")
+                    print("-" * 60)
+                    print("智能体ID | 贡献占比 | 信念值 | 对抗性得分 | 行为特征")
+                    print("-" * 60)
+                    
+                    for i in range(self.n_agents):
+                        contribution = relative_contributions[i].item() * 100
+                        belief_value = beliefs[0][i].item()
+                        adversary_score = adversary_scores[i].item()
+                        
+                        # 分析行为特征
+                        behavior_features = []
+                        if belief_value > 0.6:
+                            behavior_features.append("可能是对抗性")
+                        if abs(contribution) > 50:
+                            behavior_features.append("贡献显著")
+                        if adversary_score > 0.7:
+                            behavior_features.append("高对抗倾向")
+                        if contribution < -10:
+                            behavior_features.append("负面影响")
+                        
+                        behavior_str = ", ".join(behavior_features) if behavior_features else "正常"
+                        
+                        print(f"{i:^9d} | {contribution:^8.2f}% | {belief_value:^6.4f} | {adversary_score:^10.4f} | {behavior_str}")
+                    
+                    print("-" * 60)
+                    return relative_contributions, adversary_scores
+                
+                return None, None
+                
+        except Exception as e:
+            print(f"\n分析智能体贡献时出错: {str(e)}")
+            return None, None

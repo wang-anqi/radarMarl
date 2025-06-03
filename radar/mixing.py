@@ -70,6 +70,78 @@ class QMixNet(nn.Module):
             nn.Linear(mixing_embed_dim, n_agents),
             nn.Sigmoid()
         )
+        
+        # 添加对抗性分析网络
+        self.adversary_analyzer = nn.Sequential(
+            nn.Linear(mixing_embed_dim, mixing_embed_dim),
+            nn.ReLU(),
+            nn.Linear(mixing_embed_dim, 1),
+            nn.Sigmoid()
+        )
+        
+        # 添加贡献度追踪
+        self.contribution_history = {i: [] for i in range(n_agents)}
+        self.adversary_score_history = {i: [] for i in range(n_agents)}
+
+    def analyze_agent_contributions(self, weighted_qs, w1, beliefs):
+        """分析每个智能体的贡献度和对抗性"""
+        with torch.no_grad():
+            # 计算每个智能体的贡献
+            contributions = (weighted_qs.squeeze() * w1.mean(dim=2)).sum(dim=1)
+            total_contribution = contributions.abs().sum()
+            
+            if total_contribution > 0:
+                relative_contributions = contributions / total_contribution
+                
+                # 计算每个智能体的对抗性得分
+                adversary_scores = self.adversary_analyzer(w1.mean(dim=1))
+                
+                print("\n智能体贡献分析:")
+                print("-" * 60)
+                print("智能体ID | 贡献占比 | 信念值 | 对抗性得分 | 行为特征")
+                print("-" * 60)
+                
+                for i in range(self.n_agents):
+                    contribution = relative_contributions[i].item() * 100
+                    belief_value = beliefs[0][i].item()
+                    adversary_score = adversary_scores[0][i].item()
+                    
+                    # 更新历史记录
+                    self.contribution_history[i].append(contribution)
+                    self.adversary_score_history[i].append(adversary_score)
+                    
+                    # 计算历史统计
+                    if len(self.contribution_history[i]) > 100:
+                        self.contribution_history[i].pop(0)
+                        self.adversary_score_history[i].pop(0)
+                    
+                    avg_contribution = sum(self.contribution_history[i]) / len(self.contribution_history[i])
+                    contribution_std = torch.tensor(self.contribution_history[i]).std().item()
+                    
+                    # 分析行为特征
+                    behavior_features = []
+                    if belief_value > 0.6:
+                        behavior_features.append("可能是对抗性")
+                    if contribution_std > 20:
+                        behavior_features.append("贡献不稳定")
+                    if adversary_score > 0.7:
+                        behavior_features.append("高对抗倾向")
+                    if avg_contribution < -10:
+                        behavior_features.append("负面影响")
+                    
+                    behavior_str = ", ".join(behavior_features) if behavior_features else "正常"
+                    
+                    print(f"{i:^9d} | {contribution:^8.2f}% | {belief_value:^6.4f} | {adversary_score:^10.4f} | {behavior_str}")
+                
+                print("-" * 60)
+                print(f"* 贡献占比: 正值表示正面贡献，负值表示负面影响")
+                print(f"* 信念值: 越高表示越可能是对抗性智能体")
+                print(f"* 对抗性得分: 基于行为模式分析的对抗倾向")
+                print("-" * 60)
+                
+                return relative_contributions, adversary_scores
+            
+            return None, None
 
     def forward(self, agent_qs, states, beliefs):
         """
@@ -147,20 +219,8 @@ class QMixNet(nn.Module):
         q_total = torch.bmm(hidden, w2) + b2  # [batch_size, 1, 1]
         q_total = q_total.view(batch_size, -1)  # [batch_size, 1]
         
-        # 打印每个智能体的贡献占比
-        with torch.no_grad():
-            contributions = (weighted_qs.squeeze() * w1.mean(dim=2)).sum(dim=1)
-            total_contribution = contributions.abs().sum()
-            if total_contribution > 0:
-                relative_contributions = contributions / total_contribution
-                
-                print("\n智能体贡献占比:")
-                for i in range(self.n_agents):
-                    contribution = relative_contributions[i].item() * 100
-                    belief_value = beliefs[0][i].item()
-                    agent_type = "可能是对抗性" if belief_value > 0.6 else "正常"
-                    print(f"智能体 {i} ({agent_type}): {contribution:.2f}% (信念值: {belief_value:.4f})")
-                print("-" * 40)
+        # 分析智能体贡献
+        self.analyze_agent_contributions(weighted_qs, w1, beliefs)
         
         return q_total
 

@@ -28,6 +28,10 @@ if len(sys.argv) < 3:
 # 获取算法名称
 params["algorithm_name"] = sys.argv[1]
 
+# 添加历史特征相关参数
+if params["algorithm_name"] == "BELIEF_QMIX":
+    print("\n使用完整历史信息进行智能体行为分析")
+
 # 获取域名
 params["domain_name"] = utils.get_argument(sys.argv, 2, None)
 if params["domain_name"] is None:
