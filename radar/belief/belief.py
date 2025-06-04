@@ -183,10 +183,35 @@ class Belief(nn.Module):
         self.num_agents = num_agents
         self.device = device
         
+        # 训练统计
+        self.training_stats = {
+            'episode_returns': [],
+            'belief_values_history': [],
+            'policy_updates': 0,
+            'best_return': float('-inf'),
+            'no_improvement_count': 0,
+            'current_episode_data': None  # 存储当前episode的数据
+        }
+        
+        # 训练参数
+        self.learning_rate = 0.001
+        self.lr_decay = 0.9
+        self.lr_decay_steps = 500
+        self.early_stop_patience = 5
+        self.min_episodes = 20
+        self.max_episodes = 30
+        self.steps_per_episode = 50
+        
         print("\n初始化信念网络:")
         print(f"观察空间维度: {self.obs_dim}")
         print(f"动作空间维度: {self.action_dim}")
         print(f"智能体数量: {self.num_agents}")
+        print("\n训练参数:")
+        print(f"初始学习率: {self.learning_rate}")
+        print(f"学习率衰减: {self.lr_decay} (每{self.lr_decay_steps}步)")
+        print(f"最小训练episode数: {self.min_episodes}")
+        print(f"最大训练episode数: {self.max_episodes}")
+        print(f"每个episode的步数: {self.steps_per_episode}")
         
         # 网络参数
         self.hidden_dim = 128
@@ -209,7 +234,7 @@ class Belief(nn.Module):
         # 初始化参数
         self.init_parameters()
         
-        print(f"网络结构:")
+        print(f"\n网络结构:")
         print(f"输入维度: {self.input_dim}")
         print(f"输入层: {self.input_dim} -> {self.hidden_dim}")
         print(f"隐藏层: {self.hidden_dim} -> {self.hidden_dim}")
@@ -258,6 +283,183 @@ class Belief(nn.Module):
             
         return padded_beliefs
 
+    def normalize_input(self, x):
+        """归一化输入数据到[0,1]范围
+        
+        参数:
+            x: 输入张量
+            
+        返回:
+            normalized_x: 归一化后的张量
+        """
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            print("警告: 输入数据包含NaN或Inf值，将被替换为0")
+            x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=0.0)
+        
+        if x.dim() > 1:
+            # 对每个特征维度分别归一化
+            dims = list(range(x.dim()))[:-1]  # 除了最后一个维度外的所有维度
+            min_vals, _ = x.min(dim=dims[0], keepdim=True)
+            max_vals, _ = x.max(dim=dims[0], keepdim=True)
+            
+            # 处理最大值等于最小值的情况
+            diff = max_vals - min_vals
+            diff[diff == 0] = 1.0  # 避免除以0
+            
+            normalized_x = (x - min_vals) / diff
+        else:
+            # 一维数据直接归一化
+            min_val = x.min()
+            max_val = x.max()
+            if min_val == max_val:
+                normalized_x = torch.zeros_like(x)
+            else:
+                normalized_x = (x - min_val) / (max_val - min_val)
+        
+        # 确保所有值都在[0,1]范围内
+        normalized_x = torch.clamp(normalized_x, 0.0, 1.0)
+        
+        return normalized_x
+
+    def analyze_agent_contributions(self, belief_values, returns, actions):
+        """分析智能体的贡献
+        
+        参数:
+            belief_values: 信念值 [batch_size, num_agents]
+            returns: 回报值 [batch_size]
+            actions: 动作历史 [batch_size, num_agents]
+            
+        返回:
+            contributions: 每个智能体的贡献分析结果
+        """
+        try:
+            batch_size = belief_values.size(0)
+            contributions = []
+            
+            # 计算每个智能体的贡献
+            for agent_id in range(self.num_agents):
+                # 获取该智能体的信念值
+                agent_beliefs = belief_values[:, agent_id]
+                
+                # 计算对抗性得分（基于信念值和回报的加权）
+                adversarial_score = 0.7 * agent_beliefs.mean().item() + 0.3 * (returns.mean().item() if returns is not None else 0.5)
+                
+                # 计算行为特征
+                if actions is not None and actions.size(1) > agent_id:
+                    action_changes = (actions[1:, agent_id] != actions[:-1, agent_id]).float().mean().item()
+                    behavior = "活跃" if action_changes > 0.5 else "正常"
+                else:
+                    action_changes = 0.0
+                    behavior = "正常"
+                
+                # 计算贡献占比（基于信念值）
+                contribution_ratio = (agent_beliefs / belief_values.sum(dim=1, keepdim=True)).mean().item() * 100
+                
+                contributions.append({
+                    'agent_id': agent_id,
+                    'contribution_ratio': contribution_ratio,
+                    'belief_value': agent_beliefs.mean().item(),
+                    'adversarial_score': adversarial_score,
+                    'behavior': behavior,
+                    'action_changes': action_changes
+                })
+            
+            # 打印分析结果
+            print("\n智能体贡献分析:")
+            print("-" * 60)
+            print("智能体ID | 贡献占比 | 信念值 | 对抗性得分 | 行为特征")
+            print("-" * 60)
+            for contrib in contributions:
+                print(f"{contrib['agent_id']:^8} | {contrib['contribution_ratio']:^8.2f}% | {contrib['belief_value']:^6.4f} | {contrib['adversarial_score']:^9.4f} | {contrib['behavior']}")
+            
+            return contributions
+            
+        except Exception as e:
+            print(f"\n智能体贡献分析失败: {str(e)}")
+            return None
+
+    def process_episode_data(self, returns=None, actions=None):
+        """处理当前episode的数据
+        
+        参数:
+            returns: episode的回报值
+            actions: episode的动作历史
+        """
+        if self.training_stats['current_episode_data'] is None:
+            print("警告: 没有当前episode的数据")
+            return False
+            
+        try:
+            episode_data = self.training_stats['current_episode_data']
+            episode_data['returns'] = returns
+            episode_data['actions'] = actions
+            
+            # 更新策略
+            policy_updated = self.update_policy(episode_data)
+            
+            # 清除当前episode数据
+            self.training_stats['current_episode_data'] = None
+            
+            return policy_updated
+            
+        except Exception as e:
+            print(f"处理episode数据失败: {str(e)}")
+            return False
+
+    def update_policy(self, episode_data):
+        """更新策略"""
+        try:
+            # 提取episode数据
+            belief_values = episode_data.get('belief_values')
+            returns = episode_data.get('returns')
+            actions = episode_data.get('actions')
+            
+            if belief_values is None:
+                print("警告: 没有信念值数据，无法更新策略")
+                return False
+            
+            # 分析智能体贡献
+            contributions = self.analyze_agent_contributions(belief_values, returns, actions)
+            if contributions is None:
+                return False
+            
+            # 根据贡献调整策略
+            policy_updated = False
+            total_agents = len(contributions)
+            active_agents = 0
+            
+            for contrib in contributions:
+                # 如果智能体表现出对抗性特征
+                if contrib['adversarial_score'] > 0.55:  # 降低阈值
+                    # 增加该智能体的监控权重
+                    self.training_stats['policy_updates'] += 1
+                    policy_updated = True
+                    active_agents += 1
+                    print(f"\n增加智能体 {contrib['agent_id']} 的监控权重")
+                
+                # 如果智能体表现异常活跃
+                if contrib['action_changes'] > 0.6:  # 降低阈值
+                    # 调整该智能体的行为约束
+                    self.training_stats['policy_updates'] += 1
+                    policy_updated = True
+                    active_agents += 1
+                    print(f"\n调整智能体 {contrib['agent_id']} 的行为约束")
+            
+            if policy_updated:
+                print(f"\n策略更新成功! 总更新次数: {self.training_stats['policy_updates']}")
+                print(f"活跃智能体比例: {active_agents}/{total_agents} ({active_agents/total_agents*100:.2f}%)")
+            else:
+                print("\n本episode无需更新策略")
+            
+            return policy_updated
+            
+        except Exception as e:
+            print(f"\n策略更新失败: {str(e)}")
+            print(f"错误详情: belief_values shape: {belief_values.shape if belief_values is not None else 'None'}")
+            print(f"returns shape: {returns.shape if returns is not None else 'None'}")
+            print(f"actions shape: {actions.shape if actions is not None else 'None'}")
+            return False
+
     def forward(self, inputs, hidden_states, masks=None):
         """前向传播
         
@@ -299,11 +501,15 @@ class Belief(nn.Module):
             else:
                 raise ValueError(f"不支持的输入维度: {inputs.dim()}, 输入形状: {inputs.shape}")
             
+            # 归一化输入数据
+            inputs = self.normalize_input(inputs)
+            
             print(f"\n数据维度信息:")
             print(f"Batch size: {batch_size}")
             print(f"Number of agents: {num_agents}")
             print(f"Original number of agents: {original_num_agents}")
             print(f"Input shape after reshape: {inputs.shape}")
+            print(f"Input value range: [{inputs.min().item():.4f}, {inputs.max().item():.4f}]")
             
             # 处理掩码
             if masks is not None:
@@ -320,6 +526,8 @@ class Belief(nn.Module):
                 # 将有效的掩码部分复制到新掩码中
                 new_masks[:, :masks.size(1), :] = masks
                 masks = new_masks
+                # 确保掩码值在[0,1]范围内
+                masks = torch.clamp(masks, 0.0, 1.0)
             
             # 重塑输入以适应处理
             flattened_input = inputs.view(-1, inputs.size(-1))  # [batch_size * num_agents, input_dim]
@@ -354,7 +562,7 @@ class Belief(nn.Module):
             
             # 输出层
             x = x[:, -1]  # 取最后一个时间步
-            belief_values = torch.sigmoid(self.fc_out(x))
+            belief_values = torch.sigmoid(self.fc_out(x))  # sigmoid确保输出在[0,1]范围内
             belief_values = belief_values.view(batch_size, num_agents)
             
             # 应用掩码（如果提供）
@@ -367,15 +575,60 @@ class Belief(nn.Module):
                 print(f"调整信念值维度: 从 {belief_values.shape} 到 [batch_size, {original_num_agents}]")
                 belief_values = self.get_padded_belief_values(belief_values, original_num_agents)
             
+            # 最后确保所有输出值都在[0,1]范围内
+            belief_values = torch.clamp(belief_values, 0.0, 1.0)
+            print(f"信念值范围: [{belief_values.min().item():.4f}, {belief_values.max().item():.4f}]")
+            
+            # 存储当前episode的数据
+            self.training_stats['current_episode_data'] = {
+                'belief_values': belief_values.detach(),  # 分离计算图
+                'returns': None,
+                'actions': None
+            }
+            
+            # 只返回必要的值
             return belief_values, new_hidden_states
             
         except Exception as e:
             print(f"\n信念网络前向传播出错: {str(e)}")
-            print(f"输入类型: {type(inputs)}")
-            print(f"输入形状: {inputs.shape if hasattr(inputs, 'shape') else '未知'}")
-            print(f"输入维度: {self.input_dim}")
-            print(f"隐藏状态类型: {type(hidden_states)}")
-            print(f"隐藏状态形状: {hidden_states.shape if hidden_states is not None and hasattr(hidden_states, 'shape') else 'None'}")
-            print(f"掩码类型: {type(masks)}")
-            print(f"掩码形状: {masks.shape if masks is not None and hasattr(masks, 'shape') else 'None'}")
+            self.training_stats['current_episode_data'] = None
             return None, None
+
+    def update_training_stats(self, episode_return, belief_values):
+        """更新训练统计信息"""
+        self.training_stats['episode_returns'].append(episode_return)
+        self.training_stats['belief_values_history'].append(belief_values.mean().item())
+        
+        # 检查是否有改善
+        if episode_return > self.training_stats['best_return']:
+            self.training_stats['best_return'] = episode_return
+            self.training_stats['no_improvement_count'] = 0
+        else:
+            self.training_stats['no_improvement_count'] += 1
+        
+        # 打印训练统计
+        print("\n训练统计:")
+        print(f"当前episode回报: {episode_return:.4f}")
+        print(f"最佳episode回报: {self.training_stats['best_return']:.4f}")
+        print(f"平均信念值: {belief_values.mean().item():.4f}")
+        print(f"无改善episode数: {self.training_stats['no_improvement_count']}")
+        
+        # 检查是否需要停止训练
+        should_stop = False
+        if len(self.training_stats['episode_returns']) >= self.min_episodes:
+            if self.training_stats['no_improvement_count'] >= self.early_stop_patience:
+                print("\n提前停止训练: 连续5个episode没有改善")
+                should_stop = True
+            elif len(self.training_stats['episode_returns']) >= self.max_episodes:
+                print("\n达到最大episode数，停止训练")
+                should_stop = True
+        
+        return should_stop
+
+    def adjust_learning_rate(self, step):
+        """调整学习率"""
+        if step > 0 and step % self.lr_decay_steps == 0:
+            self.learning_rate *= self.lr_decay
+            print(f"\n调整学习率: {self.learning_rate:.6f}")
+            return True
+        return False

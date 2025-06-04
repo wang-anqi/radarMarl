@@ -896,6 +896,15 @@ class BeliefQMIXLearner:
                 if beliefs.dim() == 1:
                     beliefs = beliefs.unsqueeze(0)
                 
+                # 确保所有输入的batch维度一致
+                batch_size = max(weighted_qs.size(0), w1.size(0), beliefs.size(0))
+                if weighted_qs.size(0) == 1:
+                    weighted_qs = weighted_qs.expand(batch_size, -1, -1)
+                if w1.size(0) == 1:
+                    w1 = w1.expand(batch_size, -1, -1)
+                if beliefs.size(0) == 1:
+                    beliefs = beliefs.expand(batch_size, -1)
+                
                 # 计算每个智能体的贡献
                 contributions = (weighted_qs.squeeze() * w1.mean(dim=2)).sum(dim=1)
                 total_contribution = contributions.abs().sum()
@@ -912,24 +921,25 @@ class BeliefQMIXLearner:
                     print("-" * 60)
                     
                     for i in range(self.n_agents):
-                        contribution = relative_contributions[i].item() * 100
-                        belief_value = beliefs[0][i].item()
-                        adversary_score = adversary_scores[i].item()
-                        
-                        # 分析行为特征
-                        behavior_features = []
-                        if belief_value > 0.6:
-                            behavior_features.append("可能是对抗性")
-                        if abs(contribution) > 50:
-                            behavior_features.append("贡献显著")
-                        if adversary_score > 0.7:
-                            behavior_features.append("高对抗倾向")
-                        if contribution < -10:
-                            behavior_features.append("负面影响")
-                        
-                        behavior_str = ", ".join(behavior_features) if behavior_features else "正常"
-                        
-                        print(f"{i:^9d} | {contribution:^8.2f}% | {belief_value:^6.4f} | {adversary_score:^10.4f} | {behavior_str}")
+                        if i < relative_contributions.size(0):  # 确保索引在有效范围内
+                            contribution = relative_contributions[i].item() * 100
+                            belief_value = beliefs[0][i].item() if i < beliefs.size(1) else 0.5
+                            adversary_score = adversary_scores[i].item() if i < adversary_scores.size(0) else 0.5
+                            
+                            # 分析行为特征
+                            behavior_features = []
+                            if belief_value > 0.6:
+                                behavior_features.append("可能是对抗性")
+                            if abs(contribution) > 50:
+                                behavior_features.append("贡献显著")
+                            if adversary_score > 0.7:
+                                behavior_features.append("高对抗倾向")
+                            if contribution < -10:
+                                behavior_features.append("负面影响")
+                            
+                            behavior_str = ", ".join(behavior_features) if behavior_features else "正常"
+                            
+                            print(f"{i:^9d} | {contribution:^8.2f}% | {belief_value:^6.4f} | {adversary_score:^10.4f} | {behavior_str}")
                     
                     print("-" * 60)
                     return relative_contributions, adversary_scores
@@ -938,4 +948,173 @@ class BeliefQMIXLearner:
                 
         except Exception as e:
             print(f"\n分析智能体贡献时出错: {str(e)}")
+            print(f"Debug信息:")
+            print(f"weighted_qs shape: {weighted_qs.shape if weighted_qs is not None else 'None'}")
+            print(f"w1 shape: {w1.shape if w1 is not None else 'None'}")
+            print(f"beliefs shape: {beliefs.shape if beliefs is not None else 'None'}")
             return None, None
+
+    def process_episode_data(self, returns=None, actions=None):
+        """处理当前episode的数据
+        
+        参数:
+            returns: episode的回报值
+            actions: episode的动作历史
+        """
+        if self.training_stats['current_episode_data'] is None:
+            print("警告: 没有当前episode的数据")
+            return False
+        
+        try:
+            episode_data = self.training_stats['current_episode_data']
+            
+            # 确保数据格式正确
+            if returns is not None:
+                if not isinstance(returns, torch.Tensor):
+                    returns = torch.tensor(returns, device=self.device)
+                if returns.dim() == 1:
+                    returns = returns.unsqueeze(0)
+                episode_data['returns'] = returns
+            
+            if actions is not None:
+                if not isinstance(actions, torch.Tensor):
+                    actions = torch.tensor(actions, device=self.device)
+                if actions.dim() == 1:
+                    actions = actions.unsqueeze(0)
+                episode_data['actions'] = actions
+            
+            # 更新策略
+            policy_updated = self.update_policy(episode_data)
+            
+            # 清除当前episode数据
+            self.training_stats['current_episode_data'] = None
+            
+            return policy_updated
+            
+        except Exception as e:
+            print(f"处理episode数据失败: {str(e)}")
+            print("Debug信息:")
+            print(f"returns shape: {returns.shape if returns is not None and isinstance(returns, torch.Tensor) else 'None'}")
+            print(f"actions shape: {actions.shape if actions is not None and isinstance(actions, torch.Tensor) else 'None'}")
+            return False
+
+    def update_policy(self, episode_data):
+        """更新策略"""
+        try:
+            # 提取episode数据
+            belief_values = episode_data.get('belief_values')
+            returns = episode_data.get('returns')
+            actions = episode_data.get('actions')
+            
+            if belief_values is None:
+                print("警告: 没有信念值数据，无法更新策略")
+                return False
+            
+            # 确保belief_values维度正确
+            if belief_values.dim() == 1:
+                belief_values = belief_values.unsqueeze(0)
+            
+            # 分析智能体贡献
+            contributions = []
+            total_agents = belief_values.size(1)
+            
+            print("\n策略更新分析详情:")
+            print("-" * 80)
+            print("智能体ID | 信念值 | 行为得分 | 动作变化率 | 回报均值 | 更新决策")
+            print("-" * 80)
+            
+            policy_updated = False
+            active_agents = 0
+            
+            # 动态阈值计算
+            belief_mean = belief_values.mean().item()
+            belief_std = belief_values.std().item()
+            dynamic_threshold = min(0.6, max(0.4, belief_mean + belief_std))
+            
+            for i in range(total_agents):
+                # 获取智能体信息
+                belief_value = belief_values[0][i].item()
+                
+                # 计算行为评估分数
+                behavior_score = 0.0
+                action_change_rate = 0.0
+                return_mean = 0.0
+                
+                if returns is not None and i < returns.size(1):
+                    return_mean = returns[0][i].item()
+                    behavior_score += return_mean * 0.4
+                
+                if actions is not None and i < actions.size(1):
+                    action_changes = torch.diff(actions[:, i].float()).abs()
+                    action_change_rate = action_changes.mean().item()
+                    behavior_score += (1.0 - action_change_rate) * 0.3  # 较低的动作变化率可能更好
+                
+                # 根据历史信息调整行为得分
+                if i in self.agent_history:
+                    hist = self.agent_history[i]
+                    if len(hist['rewards']) > 0:
+                        recent_rewards = torch.tensor(hist['rewards'][-10:])
+                        reward_trend = (recent_rewards[-1] - recent_rewards[0]) if len(recent_rewards) > 1 else 0
+                        behavior_score += reward_trend * 0.3
+                
+                # 评估智能体状态和决定是否更新
+                update_decision = []
+                
+                # 1. 基于信念值的更新
+                if belief_value > dynamic_threshold:
+                    update_decision.append("信念值过高")
+                    active_agents += 1
+                    policy_updated = True
+                
+                # 2. 基于行为得分的更新
+                if behavior_score < -0.3:
+                    update_decision.append("消极行为")
+                    active_agents += 1
+                    policy_updated = True
+                elif behavior_score > 0.3:
+                    update_decision.append("积极行为")
+                
+                # 3. 基于动作变化率的更新
+                if action_change_rate > 0.7:
+                    update_decision.append("动作不稳定")
+                    active_agents += 1
+                    policy_updated = True
+                
+                # 4. 基于回报的更新
+                if return_mean < -0.2:
+                    update_decision.append("低回报")
+                    active_agents += 1
+                    policy_updated = True
+                
+                decision_str = ", ".join(update_decision) if update_decision else "无需更新"
+                
+                print(f"{i:^8d} | {belief_value:^6.4f} | {behavior_score:^8.4f} | {action_change_rate:^10.4f} | {return_mean:^8.4f} | {decision_str}")
+                
+                contributions.append({
+                    'agent_id': i,
+                    'belief_value': belief_value,
+                    'behavior_score': behavior_score,
+                    'action_change_rate': action_change_rate,
+                    'return_mean': return_mean,
+                    'decision': decision_str
+                })
+            
+            print("-" * 80)
+            print(f"动态信念阈值: {dynamic_threshold:.4f} (均值: {belief_mean:.4f}, 标准差: {belief_std:.4f})")
+            if policy_updated:
+                print(f"策略更新成功! 活跃智能体: {active_agents}/{total_agents}")
+                print(f"累计更新次数: {self.training_stats['policy_updates'] + 1}")
+                self.training_stats['policy_updates'] += 1
+            else:
+                print("本episode无需更新策略")
+            print("-" * 80)
+            
+            return policy_updated
+            
+        except Exception as e:
+            print(f"\n策略更新失败: {str(e)}")
+            print("Debug信息:")
+            print(f"belief_values shape: {belief_values.shape if belief_values is not None else 'None'}")
+            print(f"returns shape: {returns.shape if returns is not None else 'None'}")
+            print(f"actions shape: {actions.shape if actions is not None else 'None'}")
+            return False

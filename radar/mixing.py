@@ -85,62 +85,88 @@ class QMixNet(nn.Module):
 
     def analyze_agent_contributions(self, weighted_qs, w1, beliefs):
         """分析每个智能体的贡献度和对抗性"""
-        with torch.no_grad():
-            # 计算每个智能体的贡献
-            contributions = (weighted_qs.squeeze() * w1.mean(dim=2)).sum(dim=1)
-            total_contribution = contributions.abs().sum()
-            
-            if total_contribution > 0:
-                relative_contributions = contributions / total_contribution
+        try:
+            with torch.no_grad():
+                # 确保维度正确
+                if weighted_qs.dim() == 2:
+                    weighted_qs = weighted_qs.unsqueeze(0)
+                if w1.dim() == 2:
+                    w1 = w1.unsqueeze(0)
+                if beliefs.dim() == 1:
+                    beliefs = beliefs.unsqueeze(0)
                 
-                # 计算每个智能体的对抗性得分
-                adversary_scores = self.adversary_analyzer(w1.mean(dim=1))
+                # 计算每个智能体的贡献
+                contributions = (weighted_qs.squeeze() * w1.mean(dim=2)).sum(dim=1)
+                total_contribution = contributions.abs().sum()
                 
-                print("\n智能体贡献分析:")
-                print("-" * 60)
-                print("智能体ID | 贡献占比 | 信念值 | 对抗性得分 | 行为特征")
-                print("-" * 60)
+                if total_contribution > 0:
+                    relative_contributions = contributions / total_contribution
+                    
+                    # 计算每个智能体的对抗性得分
+                    adversary_scores = torch.sigmoid(w1.mean(dim=2)).mean(dim=1)
+                    
+                    print("\n智能体贡献分析详情:")
+                    print("-" * 80)
+                    print("智能体ID | 贡献占比 | 信念值 | 对抗性得分 | 权重均值 | Q值均值 | 行为特征")
+                    print("-" * 80)
+                    
+                    for i in range(self.n_agents):
+                        if i < relative_contributions.size(0):
+                            contribution = relative_contributions[i].item() * 100
+                            belief_value = beliefs[0][i].item() if i < beliefs.size(1) else 0.5
+                            adversary_score = adversary_scores[i].item() if i < adversary_scores.size(0) else 0.5
+                            weight_mean = w1[0, i].mean().item()
+                            q_mean = weighted_qs[0, 0, i].item()
+                            
+                            # 更新历史记录
+                            self.contribution_history[i].append(contribution)
+                            self.adversary_score_history[i].append(adversary_score)
+                            
+                            # 计算历史统计
+                            if len(self.contribution_history[i]) > 100:
+                                self.contribution_history[i].pop(0)
+                                self.adversary_score_history[i].pop(0)
+                            
+                            avg_contribution = sum(self.contribution_history[i]) / len(self.contribution_history[i])
+                            contribution_std = torch.tensor(self.contribution_history[i]).std().item()
+                            
+                            # 分析行为特征
+                            behavior_features = []
+                            if belief_value > 0.6:
+                                behavior_features.append("高信念值")
+                            if abs(contribution) > 30:
+                                behavior_features.append("显著贡献")
+                            if adversary_score > 0.7:
+                                behavior_features.append("高对抗倾向")
+                            if contribution < -20:
+                                behavior_features.append("负面影响")
+                            if contribution_std > 20:
+                                behavior_features.append("不稳定")
+                            if abs(weight_mean) > 0.8:
+                                behavior_features.append("高权重")
+                            
+                            behavior_str = ", ".join(behavior_features) if behavior_features else "正常"
+                            
+                            print(f"{i:^9d} | {contribution:^8.2f}% | {belief_value:^6.4f} | {adversary_score:^10.4f} | {weight_mean:^8.4f} | {q_mean:^7.4f} | {behavior_str}")
+                    
+                    print("-" * 80)
+                    print(f"* 贡献占比: 正值表示正面贡献，负值表示负面影响")
+                    print(f"* 信念值: 越高表示越可能是对抗性智能体")
+                    print(f"* 对抗性得分: 基于行为模式分析的对抗倾向")
+                    print(f"* 权重均值: 智能体在混合网络中的重要性")
+                    print(f"* Q值均值: 智能体的动作价值估计")
+                    print("-" * 80)
+                    
+                    return relative_contributions, adversary_scores
                 
-                for i in range(self.n_agents):
-                    contribution = relative_contributions[i].item() * 100
-                    belief_value = beliefs[0][i].item()
-                    adversary_score = adversary_scores[0][i].item()
-                    
-                    # 更新历史记录
-                    self.contribution_history[i].append(contribution)
-                    self.adversary_score_history[i].append(adversary_score)
-                    
-                    # 计算历史统计
-                    if len(self.contribution_history[i]) > 100:
-                        self.contribution_history[i].pop(0)
-                        self.adversary_score_history[i].pop(0)
-                    
-                    avg_contribution = sum(self.contribution_history[i]) / len(self.contribution_history[i])
-                    contribution_std = torch.tensor(self.contribution_history[i]).std().item()
-                    
-                    # 分析行为特征
-                    behavior_features = []
-                    if belief_value > 0.6:
-                        behavior_features.append("可能是对抗性")
-                    if contribution_std > 20:
-                        behavior_features.append("贡献不稳定")
-                    if adversary_score > 0.7:
-                        behavior_features.append("高对抗倾向")
-                    if avg_contribution < -10:
-                        behavior_features.append("负面影响")
-                    
-                    behavior_str = ", ".join(behavior_features) if behavior_features else "正常"
-                    
-                    print(f"{i:^9d} | {contribution:^8.2f}% | {belief_value:^6.4f} | {adversary_score:^10.4f} | {behavior_str}")
+                return None, None
                 
-                print("-" * 60)
-                print(f"* 贡献占比: 正值表示正面贡献，负值表示负面影响")
-                print(f"* 信念值: 越高表示越可能是对抗性智能体")
-                print(f"* 对抗性得分: 基于行为模式分析的对抗倾向")
-                print("-" * 60)
-                
-                return relative_contributions, adversary_scores
-            
+        except Exception as e:
+            print(f"\n分析智能体贡献时出错: {str(e)}")
+            print(f"Debug信息:")
+            print(f"weighted_qs shape: {weighted_qs.shape if weighted_qs is not None else 'None'}")
+            print(f"w1 shape: {w1.shape if w1 is not None else 'None'}")
+            print(f"beliefs shape: {beliefs.shape if beliefs is not None else 'None'}")
             return None, None
 
     def forward(self, agent_qs, states, beliefs):
