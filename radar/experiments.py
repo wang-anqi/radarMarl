@@ -96,6 +96,7 @@ def run_default_test(env, nr_test_episodes, controller, params, log_level, is_ad
 
 def run_test_suite(env, nr_test_episodes, controller, params, log_level, is_adversary):
     """运行测试套件"""
+    # 适用于评估算法在“当前训练状态下”的泛化能力，不会执行策略更新
     try:
         algorithm_choice = params["algorithm_name"]
         original_adversary_ratio = controller.adversary_ratio

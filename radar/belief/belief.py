@@ -200,7 +200,8 @@ class Belief(nn.Module):
         self.early_stop_patience = 5
         self.min_episodes = 20
         self.max_episodes = 30
-        self.steps_per_episode = 50
+        # self.steps_per_episode = 50
+        self.steps_per_episode = 2
         
         print("\n初始化信念网络:")
         print(f"观察空间维度: {self.obs_dim}")

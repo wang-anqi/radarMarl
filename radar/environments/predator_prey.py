@@ -196,7 +196,8 @@ def make(domain, params):
     params["nr_actions"] = len(GRIDWORLD_ACTIONS)
     params["gamma"] = 0.95
     params["obstacles"] = []
-    params["time_limit"] = 50
+    params["time_limit"] = 5
+    # params["time_limit"] = 50
     params["fixed_initial_position"] = False
     params["collisions_allowed"] = True
     layout, params["nr_agents"] = PREDATOR_PREY_LAYOUTS[domain]

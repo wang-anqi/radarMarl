@@ -53,7 +53,8 @@ else:
         print_usage()
 
 params["test_suite"] = experiments.run_test_suite
-params["nr_test_episodes"] = 50
+params["nr_test_episodes"] = 2
+# params["nr_test_episodes"] = 50
 
 # 创建环境
 try:

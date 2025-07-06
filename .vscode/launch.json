@@ -28,6 +28,30 @@
       }
     },
     {
+      "name": "Python: BQ_generate",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/generate_test.py",
+      "args": ["BELIEF_QMIX", "PredatorPrey-8"],
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      }
+    },
+    {
+      "name": "Python: BQ_Training",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/training_run.py",
+      "args": ["BELIEF_QMIX", "PredatorPrey-8"],
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      }
+    },
+    {
       "name": "Python: Training Run",
       "type": "debugpy",
       "request": "launch",

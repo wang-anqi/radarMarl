@@ -695,7 +695,9 @@ class BeliefQMIXLearner:
         # 计算信念损失，使用更复杂的损失函数
         belief_base_loss = F.binary_cross_entropy(belief_probs, torch.zeros_like(belief_probs))
         belief_diversity_loss = -torch.std(belief_probs)  # 鼓励信念值的多样性
-        belief_temporal_loss = F.mse_loss(belief_probs, self.masks.squeeze())  # 时间一致性
+        belief_temporal_loss = F.mse_loss(belief_probs, self.masks.view_as(belief_probs))# 时间一致性
+
+        # belief_temporal_loss = F.mse_loss(belief_probs, self.masks.squeeze())  # 时间一致性
         
         belief_loss = (belief_base_loss + 
                       0.1 * belief_diversity_loss + 
