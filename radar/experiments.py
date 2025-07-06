@@ -200,6 +200,9 @@ def run(controller, nr_episodes, params, log_level=0):
             training_undiscounted_returns.append(protagonist_undiscounted_return)
             training_adversary_ratios.append(controller.adversary_ratio)
             nr_epoch_updates += 1
+
+    if hasattr(controller, 'adversarial_manager') and controller.adversarial_manager:
+        controller.adversarial_manager.print_all_stats()
             
     print(f"\n训练结束:")
     print(f"总训练步数: {total_steps}/{max_steps}")

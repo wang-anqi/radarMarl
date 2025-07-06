@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from radar.mixing import QMixNet
 from radar.belief.belief import Belief
+from radar.agents.adversarial_agent import AdversarialAgentManager, create_adversarial_config
 import numpy as np
 import random
 
@@ -58,6 +59,23 @@ class BeliefQMIXLearner:
         # 初始化prev_belief_probs
         self.prev_belief_probs = torch.ones(1, self.n_agents).to(self.device) * 0.5
         
+        # 在初始化部分添加
+        # 创建对抗性智能体配置
+        if params.get("enable_adversarial", True):
+            adversarial_config = create_adversarial_config(
+                n_agents=self.n_agents,
+                adversary_ratio=params.get("adversary_ratio", 0.3),
+                strategy=params.get("adversarial_strategy", "mixed")
+            )
+            self.adversarial_manager = AdversarialAgentManager(
+                n_agents=self.n_agents,
+                n_actions=self.n_actions,
+                adversarial_config=adversarial_config
+            )
+            print(f"已启用对抗性智能体管理器")
+        else:
+            self.adversarial_manager = None
+            print(f"未启用对抗性智能体")
         # 初始化QMIX网络
         self.qmix_net = QMixNet(
             args=params,
@@ -595,14 +613,6 @@ class BeliefQMIXLearner:
         return q_values
 
     def policy(self, observations, training_mode=True):
-        """根据当前观察生成动作
-        
-        参数:
-            observations: 观察值
-            training_mode: 是否为训练模式
-        返回:
-            actions: 动作列表
-        """
         # 更新belief状态
         belief_probs = self.update_belief_states(observations, None)
         
@@ -611,16 +621,32 @@ class BeliefQMIXLearner:
         
         # 选择每个智能体的动作
         actions = []
+        action_infos = []
+        
         for agent_id in range(self.n_agents):
             if training_mode:
                 # 训练模式下使用epsilon-greedy策略
                 if random.random() < self.params.get("epsilon", 0.1):
-                    action = random.randint(0, self.n_actions - 1)
+                    normal_action = random.randint(0, self.n_actions - 1)
                 else:
-                    action = q_values[agent_id].argmax().item()
+                    normal_action = q_values[agent_id].argmax().item()
             else:
                 # 测试模式下直接选择最优动作
-                action = q_values[agent_id].argmax().item()
+                normal_action = q_values[agent_id].argmax().item()
+            
+            # 检查是否为对抗性智能体
+            if self.adversarial_manager and self.adversarial_manager.is_adversarial(agent_id):
+                action, action_info = self.adversarial_manager.get_action(
+                    agent_id=agent_id,
+                    observation=observations[agent_id] if isinstance(observations, list) else observations,
+                    q_values=q_values[agent_id] if q_values is not None else None,
+                    normal_action=normal_action
+                )
+                action_infos.append(action_info)
+            else:
+                action = normal_action
+                action_infos.append({'type': 'normal', 'agent_id': agent_id})
+            
             actions.append(action)
         
         return actions
@@ -630,7 +656,10 @@ class BeliefQMIXLearner:
         """更新网络参数"""
         # 更新历史信息
         self.update_history(observations, joint_action, rewards)
-        
+        # 处理对抗性智能体的奖励
+        if self.adversarial_manager:
+            self.adversarial_manager.process_rewards(rewards)
+            
         # 更新belief状态
         belief_probs = self.update_belief_states(observations, None)
         

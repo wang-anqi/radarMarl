@@ -38,11 +38,14 @@ if params["domain_name"] is None:
     print("\n错误: 必须提供域名参数")
     print_usage()
 
-# 处理对抗者比例参数
+# 处理对抗者比例参数   adversary_ratio  adversarial_ratio
 if params["algorithm_name"] == "BELIEF_QMIX":
-    params["adversary_ratio"] = None
-    print("\n提示: BELIEF_QMIX使用信念网络动态判断对抗者，无需设置对抗者比例")
+    params["enable_adversarial"] = True
+    params["adversary_ratio"] = 0.3  # 30%的智能体为对抗性
+    params["adversarial_strategy"] = "mixed"  # 可选: 'first', 'random', 'mixed', 'single'
+    print(f"启用对抗性智能体: 比例={params['adversary_ratio']}, 策略={params['adversarial_strategy']}")
 else:
+    params["enable_adversarial"] = False
     params["adversary_ratio"] = utils.get_float_argument(sys.argv, 3, None)
     if params["adversary_ratio"] is None:
         print(f"\n错误: {params['algorithm_name']} 算法需要提供对抗者比例参数")
